@@ -1,7 +1,7 @@
 use std::cell::{OnceCell, RefCell};
 use std::fs;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mtp_rs::mtp::{MtpDevice, MtpDeviceInfo};
 use mtp_rs::{ObjectHandle, StorageId};
@@ -12,10 +12,10 @@ use objc2::runtime::{AnyClass, AnyObject, ProtocolObject};
 use objc2::{DefinedClass, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSBackingStoreType,
-    NSColor, NSControlTextEditingDelegate, NSDragOperation, NSFont, NSOutlineView,
-    NSOutlineViewDataSource, NSOutlineViewDelegate, NSPasteboard, NSPasteboardWriting,
-    NSPopUpButton, NSTableColumn, NSTextField, NSView, NSWindow, NSWindowDelegate,
-    NSWindowStyleMask,
+    NSColor, NSControlTextEditingDelegate, NSDragOperation, NSDraggingSession, NSFont,
+    NSOutlineView, NSOutlineViewDataSource, NSOutlineViewDelegate, NSPasteboard,
+    NSPasteboardWriting, NSPopUpButton, NSTableColumn, NSTextField, NSView, NSWindow,
+    NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{
     MainThreadMarker, NSArray, NSInteger, NSNotification, NSNumber, NSObject, NSObjectProtocol,
@@ -26,6 +26,9 @@ use tokio::runtime::{Builder, Runtime};
 use crate::model::{BrowserNode, NodeSource, message_node};
 use crate::ui::{build_browser_ui, install_main_menu};
 use crate::util::{format_bytes, format_mtp_error, sanitize_filename};
+
+const DRAG_NODE_PREFIX: &str = "macmtp-node:";
+const DRAG_MTP_TIMEOUT: Duration = Duration::from_secs(8);
 
 #[derive(Default)]
 pub(crate) struct AppDelegateIvars {
@@ -265,6 +268,36 @@ define_class!(
             Retained::autorelease_return(NSURL::fileURLWithPath(&ns_path))
         }
 
+        #[unsafe(method(outlineView:pasteboardWriterForItem:))]
+        fn outline_pasteboard_writer_for_item(
+            &self,
+            _outline_view: &NSOutlineView,
+            item: &AnyObject,
+        ) -> *mut AnyObject {
+            let Some(index) = self.item_index(Some(item)) else {
+                return std::ptr::null_mut();
+            };
+            if !self.is_drag_copyable(index) {
+                return std::ptr::null_mut();
+            }
+
+            let marker = NSString::from_str(&format!("{DRAG_NODE_PREFIX}{index}"));
+            let object: Retained<AnyObject> = marker.into_super().into();
+            Retained::autorelease_return(object)
+        }
+
+        #[unsafe(method(outlineView:draggingSession:willBeginAtPoint:forItems:))]
+        fn outline_drag_will_begin(
+            &self,
+            _outline_view: &NSOutlineView,
+            session: &NSDraggingSession,
+            _screen_point: NSPoint,
+            dragged_items: &NSArray,
+        ) {
+            let pasteboard = session.draggingPasteboard();
+            self.write_drag_items(dragged_items, &pasteboard);
+        }
+
         #[allow(deprecated)]
         #[unsafe(method(outlineView:writeItems:toPasteboard:))]
         fn outline_write_items_to_pasteboard(
@@ -302,6 +335,17 @@ impl Delegate {
             .map(NSNumber::as_usize)
     }
 
+    fn drag_item_index(&self, item: &AnyObject) -> Option<usize> {
+        if let Some(index) = self.item_index(Some(item)) {
+            return Some(index);
+        }
+
+        let marker = item.downcast_ref::<NSString>()?.to_string();
+        marker
+            .strip_prefix(DRAG_NODE_PREFIX)
+            .and_then(|index| index.parse().ok())
+    }
+
     fn selected_node_index(&self) -> Option<usize> {
         let outline = self.ivars().outline_view.get()?;
         let row = outline.selectedRow();
@@ -325,11 +369,19 @@ impl Delegate {
         let mut indexes = Vec::new();
         for index in 0..items.len() {
             let item = unsafe { items.objectAtIndex_unchecked(index) };
-            if let Some(node_index) = self.item_index(Some(item)) {
+            if let Some(node_index) = self.drag_item_index(item) {
                 indexes.push(node_index);
             }
         }
         indexes
+    }
+
+    fn is_drag_copyable(&self, index: usize) -> bool {
+        self.ivars()
+            .nodes
+            .borrow()
+            .get(index)
+            .is_some_and(|node| node.is_file() || node.is_folder())
     }
 
     fn update_detail(&self) {
@@ -508,8 +560,18 @@ impl Delegate {
     }
 
     fn load_children(&self, index: usize) {
+        if let Err(message) = self.load_children_result(index, None) {
+            let mut nodes = self.ivars().nodes.borrow_mut();
+            let child = nodes.len();
+            nodes.push(message_node("目录读取失败", &message));
+            nodes[index].children = vec![child];
+            nodes[index].children_loaded = true;
+        }
+    }
+
+    fn load_children_result(&self, index: usize, timeout: Option<Duration>) -> Result<(), String> {
         let Some(device) = self.ivars().device.borrow().clone() else {
-            return;
+            return Err("设备未连接。".to_string());
         };
         if self
             .ivars()
@@ -518,7 +580,7 @@ impl Delegate {
             .get(index)
             .is_none_or(|node| node.children_loaded)
         {
-            return;
+            return Ok(());
         }
 
         let (storage_id, parent) = {
@@ -530,29 +592,27 @@ impl Delegate {
                     handle,
                     is_folder: true,
                 }) => (*storage_id, Some(*handle)),
-                _ => return,
+                _ => return Ok(()),
             }
         };
 
         let result = self.runtime().block_on(async {
-            let storage = device.storage(storage_id).await?;
-            storage.list_objects(parent).await
+            let operation = async {
+                let storage = device.storage(storage_id).await?;
+                storage.list_objects(parent).await
+            };
+            match timeout {
+                Some(timeout) => tokio::time::timeout(timeout, operation)
+                    .await
+                    .map_err(|_| format!("MTP 目录读取超过 {} 秒。", timeout.as_secs()))?
+                    .map_err(|err| format_mtp_error(&err)),
+                None => operation.await.map_err(|err| format_mtp_error(&err)),
+            }
         });
 
         let objects = match result {
             Ok(objects) => objects,
-            Err(err) => {
-                let child = {
-                    let mut nodes = self.ivars().nodes.borrow_mut();
-                    let child = nodes.len();
-                    nodes.push(message_node("目录读取失败", &format_mtp_error(&err)));
-                    nodes[index].children = vec![child];
-                    nodes[index].children_loaded = true;
-                    child
-                };
-                let _ = child;
-                return;
-            }
+            Err(message) => return Err(message),
         };
 
         let mut nodes = self.ivars().nodes.borrow_mut();
@@ -586,6 +646,7 @@ impl Delegate {
         }
         nodes[index].children = children;
         nodes[index].children_loaded = true;
+        Ok(())
     }
 
     fn prepare_selected_file_for_preview(&self) -> Option<PathBuf> {
@@ -724,17 +785,23 @@ impl Delegate {
         let data = self
             .runtime()
             .block_on(async {
-                let storage = device.storage(storage_id).await?;
-                storage.download(handle).await
+                let operation = async {
+                    let storage = device.storage(storage_id).await?;
+                    storage.download(handle).await
+                };
+                tokio::time::timeout(DRAG_MTP_TIMEOUT, operation)
+                    .await
+                    .map_err(|_| format!("MTP 文件下载超过 {} 秒。", DRAG_MTP_TIMEOUT.as_secs()))?
+                    .map_err(|err| format_mtp_error(&err))
             })
-            .map_err(|err| format_mtp_error(&err))?;
+            .map_err(|message| message)?;
 
         fs::write(&path, data).map_err(|err| format!("无法写入文件: {err}"))?;
         Ok(path)
     }
 
     fn export_folder(&self, index: usize, name: &str, parent: &PathBuf) -> Result<PathBuf, String> {
-        self.load_children(index);
+        self.load_children_result(index, Some(DRAG_MTP_TIMEOUT))?;
         let folder = unique_child_path(parent, &sanitize_filename(name));
         fs::create_dir_all(&folder).map_err(|err| format!("无法创建文件夹: {err}"))?;
 
