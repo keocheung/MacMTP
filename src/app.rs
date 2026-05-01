@@ -684,8 +684,7 @@ impl Delegate {
             ),
             None => (
                 "未选择文件".to_string(),
-                "选择 MTP 设备后展开目录；选中文件按空格才会下载到临时目录并 Quick Look。"
-                    .to_string(),
+                "选择 MTP 设备后展开目录".to_string(),
             ),
         };
 
@@ -956,7 +955,7 @@ impl Delegate {
                     format_bytes(object.size)
                 },
                 note: format!(
-                    "Handle: {}\nStorage: {}\nQuick Look 时才会下载文件。",
+                    "Handle: {}\nStorage: {}\n选中文件按下空格预览文件。\n选中后拖拽到Finder可复制文件到本机。",
                     object.handle.0, storage_id.0
                 ),
                 source: NodeSource::Object {
