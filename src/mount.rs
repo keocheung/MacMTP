@@ -4,7 +4,9 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, SystemTime};
 
 use fuser::{
@@ -64,8 +66,10 @@ pub fn mount_device(
     }
 
     let volume_name = volume_name(device_info);
+    cleanup_existing_mountpoints(&volume_name);
     let mountpoint = unique_mountpoint(&volume_name)?;
-    let cache_dir = std::env::temp_dir().join(format!("macmtp-fuse-cache-{}", device_info.location_id));
+    let cache_dir =
+        std::env::temp_dir().join(format!("macmtp-fuse-cache-{}", device_info.location_id));
     fs::create_dir_all(&cache_dir).map_err(|err| format!("无法创建 FUSE 缓存目录: {err}"))?;
 
     let fs = MtpFuseFs::new(device, mtp_lock, cache_dir.clone());
@@ -117,18 +121,43 @@ fn volume_name(device_info: &MtpDeviceInfo) -> String {
 }
 
 fn unique_mountpoint(volume_name: &str) -> Result<PathBuf, String> {
-    let base = Path::new("/Volumes").join(volume_name);
-    for suffix in 0..100 {
-        let candidate = if suffix == 0 {
-            base.clone()
-        } else {
-            Path::new("/Volumes").join(format!("{volume_name} {suffix}"))
-        };
+    for candidate in mountpoint_candidates(volume_name) {
         if !candidate.exists() {
             return Ok(candidate);
         }
     }
     Err("无法找到可用的 /Volumes/MacMTP 挂载点名称。".to_string())
+}
+
+fn cleanup_existing_mountpoints(volume_name: &str) {
+    for candidate in mountpoint_candidates(volume_name) {
+        if !candidate.exists() {
+            continue;
+        }
+
+        let _ = Command::new("diskutil")
+            .arg("unmount")
+            .arg(&candidate)
+            .status();
+    }
+
+    thread::sleep(Duration::from_millis(300));
+
+    for candidate in mountpoint_candidates(volume_name) {
+        if candidate.exists() {
+            let _ = fs::remove_dir(&candidate);
+        }
+    }
+}
+
+fn mountpoint_candidates(volume_name: &str) -> impl Iterator<Item = PathBuf> + '_ {
+    (0..100).map(move |suffix| {
+        if suffix == 0 {
+            Path::new("/Volumes").join(volume_name)
+        } else {
+            Path::new("/Volumes").join(format!("{volume_name} {suffix}"))
+        }
+    })
 }
 
 struct MtpFuseFs {
@@ -192,7 +221,12 @@ impl MtpFuseFs {
     fn attr_for(entry: &FsEntry, uid: u32, gid: u32) -> FileAttr {
         let is_dir = matches!(
             entry.kind,
-            FsEntryKind::Root | FsEntryKind::Storage { .. } | FsEntryKind::Object { is_folder: true, .. }
+            FsEntryKind::Root
+                | FsEntryKind::Storage { .. }
+                | FsEntryKind::Object {
+                    is_folder: true,
+                    ..
+                }
         );
         FileAttr {
             ino: INodeNo(entry.ino),
@@ -240,7 +274,9 @@ impl MtpFuseFs {
 
         let entries = match parent_entry.kind {
             FsEntryKind::Root => self.load_storages(parent)?,
-            FsEntryKind::Storage { storage_id, .. } => self.load_objects(parent, storage_id, None)?,
+            FsEntryKind::Storage { storage_id, .. } => {
+                self.load_objects(parent, storage_id, None)?
+            }
             FsEntryKind::Object {
                 storage_id,
                 handle,
@@ -267,7 +303,10 @@ impl MtpFuseFs {
             runtime
                 .block_on(async { self.device.storages().await })
                 .map_err(|err| {
-                    eprintln!("MacMTP FUSE storage listing failed: {}", format_mtp_error(&err));
+                    eprintln!(
+                        "MacMTP FUSE storage listing failed: {}",
+                        format_mtp_error(&err)
+                    );
                     Errno::EIO
                 })
         })??;
@@ -309,7 +348,10 @@ impl MtpFuseFs {
                     storage.list_objects(object_parent).await
                 })
                 .map_err(|err| {
-                    eprintln!("MacMTP FUSE directory listing failed: {}", format_mtp_error(&err));
+                    eprintln!(
+                        "MacMTP FUSE directory listing failed: {}",
+                        format_mtp_error(&err)
+                    );
                     Errno::EIO
                 })
         })??;
@@ -375,14 +417,13 @@ impl MtpFuseFs {
                 .build()
                 .map_err(|_| Errno::EIO)?;
             runtime.block_on(async {
-                let storage = self
-                    .device
-                    .storage(storage_id)
-                    .await
-                    .map_err(|err| {
-                        eprintln!("MacMTP FUSE storage open failed: {}", format_mtp_error(&err));
-                        Errno::EIO
-                    })?;
+                let storage = self.device.storage(storage_id).await.map_err(|err| {
+                    eprintln!(
+                        "MacMTP FUSE storage open failed: {}",
+                        format_mtp_error(&err)
+                    );
+                    Errno::EIO
+                })?;
                 let mut download = storage.download_stream(handle).await.map_err(|err| {
                     eprintln!("MacMTP FUSE download failed: {}", format_mtp_error(&err));
                     Errno::EIO
@@ -410,17 +451,15 @@ impl MtpFuseFs {
 
 impl Filesystem for MtpFuseFs {
     fn lookup(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-        let result = self
-            .load_children(parent.into())
-            .and_then(|children| {
-                let state = self.state.lock().map_err(|_| Errno::EIO)?;
-                children
-                    .into_iter()
-                    .filter_map(|ino| state.entries.get(&ino))
-                    .find(|entry| entry.name == name)
-                    .map(|entry| Self::attr_for(entry, req.uid(), req.gid()))
-                    .ok_or(Errno::ENOENT)
-            });
+        let result = self.load_children(parent.into()).and_then(|children| {
+            let state = self.state.lock().map_err(|_| Errno::EIO)?;
+            children
+                .into_iter()
+                .filter_map(|ino| state.entries.get(&ino))
+                .find(|entry| entry.name == name)
+                .map(|entry| Self::attr_for(entry, req.uid(), req.gid()))
+                .ok_or(Errno::ENOENT)
+        });
         match result {
             Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
             Err(err) => reply.error(err),
@@ -443,7 +482,15 @@ impl Filesystem for MtpFuseFs {
             return;
         }
         match self.entry(ino.into()) {
-            Ok(entry) if matches!(entry.kind, FsEntryKind::Object { is_folder: false, .. }) => {
+            Ok(entry)
+                if matches!(
+                    entry.kind,
+                    FsEntryKind::Object {
+                        is_folder: false,
+                        ..
+                    }
+                ) =>
+            {
                 reply.opened(FileHandle(0), FopenFlags::empty());
             }
             Ok(_) => reply.error(Errno::EISDIR),
@@ -519,7 +566,11 @@ fn object_ino(storage_id: StorageId, handle: ObjectHandle) -> u64 {
 }
 
 fn unique_name(names: &mut HashMap<String, usize>, name: String) -> String {
-    let base = if name.is_empty() { "item".to_string() } else { name };
+    let base = if name.is_empty() {
+        "item".to_string()
+    } else {
+        name
+    };
     let count = names.entry(base.clone()).or_insert(0);
     *count += 1;
     if *count == 1 {

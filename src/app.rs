@@ -1,4 +1,5 @@
 use std::cell::{OnceCell, RefCell};
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
@@ -17,11 +18,11 @@ use objc2::runtime::{AnyClass, AnyObject, ProtocolObject};
 use objc2::{AnyThread, DefinedClass, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSAutoresizingMaskOptions,
-    NSBackingStoreType, NSColor, NSControlTextEditingDelegate, NSDragOperation, NSDraggingSession,
-    NSEvent, NSFilePromiseProvider, NSFilePromiseProviderDelegate, NSFont, NSLineBreakMode, NSMenu,
-    NSMenuDelegate, NSOutlineView, NSOutlineViewDataSource, NSOutlineViewDelegate, NSPasteboard,
-    NSPasteboardWriting, NSPopUpButton, NSProgressIndicator, NSTableColumn, NSTextField, NSView,
-    NSWindow, NSWindowDelegate, NSWindowStyleMask, NSWorkspace,
+    NSBackingStoreType, NSButton, NSColor, NSControlTextEditingDelegate, NSDragOperation,
+    NSDraggingSession, NSEvent, NSFilePromiseProvider, NSFilePromiseProviderDelegate, NSFont,
+    NSLineBreakMode, NSOutlineView, NSOutlineViewDataSource, NSOutlineViewDelegate, NSPasteboard,
+    NSPasteboardWriting, NSProgressIndicator, NSTableColumn, NSTextField, NSView, NSWindow,
+    NSWindowDelegate, NSWindowStyleMask, NSWorkspace,
 };
 use objc2_foundation::{
     MainThreadMarker, NSArray, NSError, NSIndexSet, NSInteger, NSNotification, NSNumber, NSObject,
@@ -45,7 +46,8 @@ const COPY_PROGRESS_THROTTLE: Duration = Duration::from_millis(120);
 pub(crate) struct AppDelegateIvars {
     pub(crate) window: OnceCell<Retained<NSWindow>>,
     pub(crate) outline_view: OnceCell<Retained<NSOutlineView>>,
-    pub(crate) device_popup: OnceCell<Retained<NSPopUpButton>>,
+    pub(crate) device_list_view: OnceCell<Retained<NSView>>,
+    pub(crate) refresh_button: OnceCell<Retained<NSButton>>,
     pub(crate) title_label: OnceCell<Retained<NSTextField>>,
     pub(crate) detail_label: OnceCell<Retained<NSTextField>>,
     pub(crate) progress_indicator: OnceCell<Retained<NSProgressIndicator>>,
@@ -54,9 +56,14 @@ pub(crate) struct AppDelegateIvars {
     device: RefCell<Option<MtpDevice>>,
     current_device_location: RefCell<Option<u64>>,
     current_mount: RefCell<Option<MountHandle>>,
+    current_mount_location: RefCell<Option<u64>>,
+    current_mounting_location: RefCell<Option<u64>>,
+    pending_mount_location: RefCell<Option<u64>>,
+    current_mtp_lock: RefCell<Option<Arc<Mutex<()>>>>,
+    device_row_views: RefCell<Vec<Retained<NSView>>>,
     nodes: RefCell<Vec<BrowserNode>>,
     root_children: RefCell<Vec<usize>>,
-    mtp_lock: Arc<Mutex<()>>,
+    mtp_locks: RefCell<HashMap<u64, Arc<Mutex<()>>>>,
     active_copies: Arc<AtomicUsize>,
     copy_events_tx: OnceCell<mpsc::Sender<CopyEvent>>,
     copy_events_rx: RefCell<Option<mpsc::Receiver<CopyEvent>>>,
@@ -168,6 +175,7 @@ define_class!(
             install_main_menu(&app, self, mtm);
             self.install_copy_event_timer();
             self.show_initial_device_prompt();
+            self.refresh_devices();
 
             window.center();
             window.makeKeyAndOrderFront(None);
@@ -195,9 +203,8 @@ define_class!(
     }
 
     unsafe impl NSOutlineViewDataSource for Delegate {}
-    unsafe impl NSControlTextEditingDelegate for Delegate {}
     unsafe impl NSOutlineViewDelegate for Delegate {}
-    unsafe impl NSMenuDelegate for Delegate {}
+    unsafe impl NSControlTextEditingDelegate for Delegate {}
 
     unsafe impl NSFilePromiseProviderDelegate for Delegate {
         #[unsafe(method(filePromiseProvider:fileNameForType:))]
@@ -372,22 +379,36 @@ define_class!(
         }
 
         #[unsafe(method(selectDevice:))]
-        fn select_device_action(&self, _sender: Option<&AnyObject>) {
+        fn select_device_action(&self, sender: Option<&AnyObject>) {
             if self.reject_mtp_while_copying("正在复制文件，暂时不能切换设备。") {
                 return;
             }
-            self.select_current_device();
+            let Some(index) = self.sender_device_index(sender) else {
+                return;
+            };
+            self.select_device_at_index(index, false);
         }
 
-        #[unsafe(method(menuWillOpen:))]
-        fn menu_will_open(&self, menu: &NSMenu) {
-            if !self.is_device_popup_menu(menu) {
+        #[unsafe(method(mountDevice:))]
+        fn mount_device_action(&self, sender: Option<&AnyObject>) {
+            if self.reject_mtp_while_copying("正在复制文件，暂时不能挂载设备。") {
                 return;
             }
-            if self.reject_mtp_while_copying("正在复制文件，暂时不能刷新设备。") {
+            let Some(index) = self.sender_device_index(sender) else {
+                return;
+            };
+            self.mount_device_at_index(index);
+        }
+
+        #[unsafe(method(ejectDevice:))]
+        fn eject_device_action(&self, sender: Option<&AnyObject>) {
+            if self.reject_mtp_while_copying("正在复制文件，暂时不能推出设备。") {
                 return;
             }
-            self.refresh_devices();
+            let Some(index) = self.sender_device_index(sender) else {
+                return;
+            };
+            self.eject_device_at_index(index);
         }
 
         #[unsafe(method(drainCopyEvents:))]
@@ -516,11 +537,11 @@ impl Delegate {
     }
 
     fn show_initial_device_prompt(&self) {
-        if let Some(popup) = self.ivars().device_popup.get() {
-            popup.removeAllItems();
-            popup.addItemWithTitle(ns_string!("请选择设备"));
-        }
-        self.set_message("请选择设备", "点击左上角设备菜单扫描并选择一个 MTP 设备。");
+        self.render_device_rows();
+        self.set_message(
+            "请选择设备",
+            "左侧设备栏会在启动时扫描 MTP 设备，也可以点击刷新。",
+        );
     }
 
     fn clear_browser_state(&self) {
@@ -539,10 +560,14 @@ impl Delegate {
 
     fn close_current_device(&self) {
         self.eject_current_mount();
+        self.ivars().current_mount_location.borrow_mut().take();
+        self.ivars().current_mounting_location.borrow_mut().take();
+        self.ivars().pending_mount_location.borrow_mut().take();
         let device = self.ivars().device.borrow_mut().take();
+        let mtp_lock = self.ivars().current_mtp_lock.borrow_mut().take();
         self.ivars().current_device_location.borrow_mut().take();
         if let Some(device) = device {
-            let _ = self.with_mtp_lock(|| {
+            let _ = self.with_mtp_lock(mtp_lock.as_ref(), || {
                 self.runtime().block_on(async {
                     device
                         .session()
@@ -551,6 +576,7 @@ impl Delegate {
                 })
             });
         }
+        self.update_mount_controls();
     }
 
     fn eject_current_mount(&self) {
@@ -561,14 +587,6 @@ impl Delegate {
         let workspace = NSWorkspace::sharedWorkspace();
         let _ = workspace.unmountAndEjectDeviceAtPath(&NSString::from_str(&path));
         drop(mount);
-    }
-
-    fn is_device_popup_menu(&self, menu: &NSMenu) -> bool {
-        self.ivars()
-            .device_popup
-            .get()
-            .and_then(|popup| popup.menu())
-            .is_some_and(|popup_menu| std::ptr::eq(menu, popup_menu.as_ref()))
     }
 
     fn item_index(&self, item: Option<&AnyObject>) -> Option<usize> {
@@ -762,87 +780,73 @@ impl Delegate {
     }
 
     fn refresh_devices(&self) {
-        let result = self.with_mtp_lock(MtpDevice::list_devices);
-        let mut devices = self.ivars().devices.borrow_mut();
-        devices.clear();
+        let result = MtpDevice::list_devices();
         let current_location = *self.ivars().current_device_location.borrow();
 
-        let Some(popup) = self.ivars().device_popup.get() else {
-            return;
-        };
-        popup.removeAllItems();
-
         match result {
-            Err(message) => {
-                popup.addItemWithTitle(ns_string!("设备扫描失败"));
-                self.set_message("设备扫描失败", &message);
+            Err(err) => {
+                self.ivars().devices.borrow_mut().clear();
+                self.set_message("设备扫描失败", &format!("{err}"));
             }
-            Ok(Ok(found)) if found.is_empty() => {
-                popup.addItemWithTitle(ns_string!("未发现 MTP 设备"));
+            Ok(found) if found.is_empty() => {
+                self.ivars().devices.borrow_mut().clear();
                 if current_location.is_some() {
                     self.close_current_device();
                     self.clear_browser_state();
                 }
                 self.set_message(
                     "未发现 MTP 设备",
-                    "连接 Android/Kindle 等 MTP 设备后点击菜单 Device -> Refresh Devices。",
+                    "连接 Android/Kindle 等 MTP 设备后点击左侧刷新按钮。",
                 );
             }
-            Ok(Ok(found)) => {
-                popup.addItemWithTitle(ns_string!("请选择设备"));
-                for device in &found {
-                    popup.addItemWithTitle(&NSString::from_str(&device.display()));
-                }
+            Ok(found) => {
                 if let Some(current_location) = current_location {
-                    if let Some(index) = found
+                    if !found
                         .iter()
-                        .position(|device| device.location_id == current_location)
+                        .any(|device| device.location_id == current_location)
                     {
-                        popup.selectItemAtIndex((index + 1) as NSInteger);
-                    } else {
                         self.close_current_device();
                         self.clear_browser_state();
                     }
                 }
-                *devices = found;
+                *self.ivars().devices.borrow_mut() = found;
                 if current_location.is_none() {
-                    self.set_message("请选择设备", "从左上角设备菜单选择一个 MTP 设备。");
+                    self.set_message("请选择设备", "从左侧设备栏选择一个 MTP 设备。");
                 }
             }
-            Ok(Err(err)) => {
-                popup.addItemWithTitle(ns_string!("设备扫描失败"));
-                self.set_message("设备扫描失败", &format!("{err}"));
-            }
         }
+        self.update_mount_controls();
     }
 
-    fn select_current_device(&self) {
-        let Some(popup) = self.ivars().device_popup.get() else {
-            return;
-        };
-        let selected = popup.indexOfSelectedItem();
-        if selected <= 0 {
-            return;
-        }
-        let device_info = match self.ivars().devices.borrow().get((selected - 1) as usize) {
+    fn select_device_at_index(&self, index: usize, mount_after_connect: bool) {
+        let device_info = match self.ivars().devices.borrow().get(index) {
             Some(info) => info.clone(),
             None => return,
         };
 
         self.close_current_device();
+        let mtp_lock = self.mtp_lock_for_device(device_info.location_id);
         self.ivars()
             .current_device_location
             .replace(Some(device_info.location_id));
+        self.ivars()
+            .current_mtp_lock
+            .replace(Some(mtp_lock.clone()));
+        if mount_after_connect {
+            self.ivars()
+                .pending_mount_location
+                .replace(Some(device_info.location_id));
+        }
         self.set_browser_message("正在连接设备", &device_info.display());
-        self.start_device_connect(device_info);
+        self.start_device_connect(device_info, mtp_lock);
     }
 
-    fn start_device_connect(&self, device_info: MtpDeviceInfo) {
+    fn start_device_connect(&self, device_info: MtpDeviceInfo, mtp_lock: Arc<Mutex<()>>) {
         let Some(tx) = self.ivars().device_events_tx.get().cloned() else {
             self.set_browser_message("连接设备失败", "设备事件通道未初始化。");
             return;
         };
-        let mtp_lock = self.ivars().mtp_lock.clone();
+        self.update_mount_controls();
         thread::spawn(move || {
             let result = run_device_connect_worker(device_info.clone(), mtp_lock);
             let _ = tx.send(DeviceEvent::Connected {
@@ -860,7 +864,8 @@ impl Delegate {
         roots: Vec<usize>,
     ) {
         if *self.ivars().current_device_location.borrow() != Some(device_info.location_id) {
-            let _ = self.with_mtp_lock(|| {
+            let mtp_lock = self.mtp_lock_for_device(device_info.location_id);
+            let _ = self.with_mtp_lock(Some(&mtp_lock), || {
                 self.runtime().block_on(async {
                     device
                         .session()
@@ -871,33 +876,101 @@ impl Delegate {
             return;
         }
 
-        let device_for_mount = device.clone();
+        let should_mount =
+            *self.ivars().pending_mount_location.borrow() == Some(device_info.location_id);
+        let device_for_mount = if should_mount {
+            Some(device.clone())
+        } else {
+            None
+        };
+
         self.ivars().device.replace(Some(device));
         *self.ivars().nodes.borrow_mut() = nodes;
         *self.ivars().root_children.borrow_mut() = roots;
         self.reload_outline();
         self.update_detail();
-        self.mount_current_device(device_for_mount, &device_info);
+        self.update_mount_controls();
+
+        if let Some(device_for_mount) = device_for_mount {
+            self.ivars().pending_mount_location.borrow_mut().take();
+            self.mount_current_device(device_for_mount, &device_info);
+            return;
+        }
+
+        self.set_message(
+            "已连接设备",
+            "可使用内置浏览器浏览文件，或点击设备旁边的挂载按钮挂载到 Finder。",
+        );
+    }
+
+    fn mount_device_at_index(&self, index: usize) {
+        let Some(device_info) = self.ivars().devices.borrow().get(index).cloned() else {
+            return;
+        };
+        let location_id = device_info.location_id;
+        if *self.ivars().current_mount_location.borrow() == Some(location_id) {
+            self.set_message("已挂载到 Finder", "这个设备已经挂载。");
+            return;
+        }
+        if *self.ivars().current_mounting_location.borrow() == Some(location_id) {
+            self.set_message("正在挂载到 Finder", "请等待这个设备的挂载操作完成。");
+            return;
+        }
+        if *self.ivars().current_device_location.borrow() != Some(location_id) {
+            self.select_device_at_index(index, true);
+            return;
+        }
+        let Some(device) = self.ivars().device.borrow().clone() else {
+            self.select_device_at_index(index, true);
+            return;
+        };
+        self.mount_current_device(device, &device_info);
+    }
+
+    fn eject_device_at_index(&self, index: usize) {
+        let Some(device_info) = self.ivars().devices.borrow().get(index).cloned() else {
+            return;
+        };
+        if *self.ivars().current_mount_location.borrow() != Some(device_info.location_id) {
+            self.set_message("未挂载到 Finder", "这个设备当前没有 Finder 挂载。");
+            return;
+        }
+        self.eject_current_mount();
+        self.ivars().current_mount_location.borrow_mut().take();
+        self.update_mount_controls();
+        self.set_message("已推出 Finder 挂载", "内置浏览器仍可继续使用当前设备。");
     }
 
     fn mount_current_device(&self, device: MtpDevice, device_info: &MtpDeviceInfo) {
         self.eject_current_mount();
+        self.ivars().current_mount_location.borrow_mut().take();
         if !mount::macfuse_available() {
             self.set_message(
                 "已连接设备",
-                "未检测到 macFUSE，保留内置浏览器模式。安装 macFUSE 后可自动挂载到 Finder。",
+                "未检测到 macFUSE，保留内置浏览器模式。安装 macFUSE 后可挂载到 Finder。",
             );
+            self.update_mount_controls();
             return;
         }
 
         let Some(tx) = self.ivars().mount_events_tx.get().cloned() else {
-            self.set_message("Finder 挂载失败", "挂载事件通道未初始化，仍可使用内置浏览器。");
+            self.set_message(
+                "Finder 挂载失败",
+                "挂载事件通道未初始化，仍可使用内置浏览器。",
+            );
             return;
         };
         let device_info = device_info.clone();
         let location_id = device_info.location_id;
-        let mtp_lock = self.ivars().mtp_lock.clone();
-        self.set_message("正在挂载到 Finder", "内置浏览器已可使用，Finder 挂载将在后台完成。");
+        let mtp_lock = self.mtp_lock_for_device(location_id);
+        self.set_message(
+            "正在挂载到 Finder",
+            "内置浏览器已可使用，Finder 挂载将在后台完成。",
+        );
+        self.ivars()
+            .current_mounting_location
+            .replace(Some(location_id));
+        self.update_mount_controls();
         thread::spawn(move || {
             let result = mount::mount_device(device, &device_info, mtp_lock);
             let _ = tx.send(MountEvent::Finished {
@@ -944,7 +1017,7 @@ impl Delegate {
             }
         };
 
-        let result = self.with_mtp_lock(|| {
+        let result = self.with_mtp_lock(self.current_mtp_lock().as_ref(), || {
             self.runtime().block_on(async {
                 let operation = async {
                     let storage = device.storage(storage_id).await?;
@@ -1021,7 +1094,7 @@ impl Delegate {
 
         self.set_message("正在准备预览", "正在从 MTP 设备复制文件到临时目录。");
         let device = self.ivars().device.borrow().clone()?;
-        let result = self.with_mtp_lock(|| {
+        let result = self.with_mtp_lock(self.current_mtp_lock().as_ref(), || {
             self.runtime().block_on(async {
                 let storage = device.storage(storage_id).await?;
                 storage.download(handle).await
@@ -1113,7 +1186,9 @@ impl Delegate {
             .get()
             .cloned()
             .ok_or_else(|| "复制进度通道未初始化。".to_string())?;
-        let mtp_lock = self.ivars().mtp_lock.clone();
+        let mtp_lock = self
+            .current_mtp_lock()
+            .ok_or_else(|| "设备操作锁未初始化。".to_string())?;
         let active_copies = self.ivars().active_copies.clone();
         if active_copies.load(Ordering::SeqCst) == 0 {
             *self.ivars().copy_error.borrow_mut() = None;
@@ -1170,8 +1245,25 @@ impl Delegate {
         self.ivars().runtime.get().expect("runtime initialized")
     }
 
-    fn with_mtp_lock<T>(&self, operation: impl FnOnce() -> T) -> Result<T, String> {
-        let mtp_lock = self.ivars().mtp_lock.clone();
+    fn mtp_lock_for_device(&self, location_id: u64) -> Arc<Mutex<()>> {
+        self.ivars()
+            .mtp_locks
+            .borrow_mut()
+            .entry(location_id)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    fn current_mtp_lock(&self) -> Option<Arc<Mutex<()>>> {
+        self.ivars().current_mtp_lock.borrow().clone()
+    }
+
+    fn with_mtp_lock<T>(
+        &self,
+        mtp_lock: Option<&Arc<Mutex<()>>>,
+        operation: impl FnOnce() -> T,
+    ) -> Result<T, String> {
+        let mtp_lock = mtp_lock.ok_or_else(|| "设备操作锁未初始化。".to_string())?;
         let _guard = mtp_lock
             .lock()
             .map_err(|_| "MTP 操作锁已损坏。".to_string())?;
@@ -1290,6 +1382,8 @@ impl Delegate {
             Err(message) => {
                 self.ivars().device.borrow_mut().take();
                 self.ivars().current_device_location.borrow_mut().take();
+                self.ivars().current_mtp_lock.borrow_mut().take();
+                self.update_mount_controls();
                 self.set_browser_message("连接设备失败", &message);
             }
         }
@@ -1317,17 +1411,33 @@ impl Delegate {
             if let Ok(handle) = result {
                 drop(handle);
             }
+            if *self.ivars().current_mounting_location.borrow() == Some(location_id) {
+                self.ivars().current_mounting_location.borrow_mut().take();
+                self.update_mount_controls();
+            }
             return;
         }
+        self.ivars().current_mounting_location.borrow_mut().take();
 
         match result {
             Ok(handle) => {
                 let path = handle.mountpoint().display().to_string();
                 self.ivars().current_mount.replace(Some(handle));
-                self.set_message("已挂载到 Finder", &format!("设备已挂载到 {path}。退出前会自动推出。"));
+                self.ivars()
+                    .current_mount_location
+                    .replace(Some(location_id));
+                self.update_mount_controls();
+                self.set_message(
+                    "已挂载到 Finder",
+                    &format!("设备已挂载到 {path}。退出前会自动推出。"),
+                );
             }
             Err(message) => {
-                self.set_message("Finder 挂载失败", &format!("{message}\n仍可使用内置浏览器。"));
+                self.update_mount_controls();
+                self.set_message(
+                    "Finder 挂载失败",
+                    &format!("{message}\n仍可使用内置浏览器。"),
+                );
             }
         }
     }
@@ -1378,11 +1488,139 @@ impl Delegate {
     }
 
     fn set_mtp_controls_enabled(&self, enabled: bool) {
-        if let Some(popup) = self.ivars().device_popup.get() {
-            popup.setEnabled(enabled);
+        if let Some(button) = self.ivars().refresh_button.get() {
+            button.setEnabled(enabled);
         }
         if let Some(outline) = self.ivars().outline_view.get() {
             outline.setEnabled(enabled);
+        }
+        if enabled {
+            self.update_mount_controls();
+        } else {
+            self.render_device_rows();
+        }
+    }
+
+    fn update_mount_controls(&self) {
+        self.render_device_rows();
+    }
+
+    fn sender_device_index(&self, sender: Option<&AnyObject>) -> Option<usize> {
+        let tag = sender?.downcast_ref::<NSButton>()?.tag();
+        if tag <= 0 {
+            return None;
+        }
+        Some((tag - 1) as usize)
+    }
+
+    fn render_device_rows(&self) {
+        let Some(device_list) = self.ivars().device_list_view.get() else {
+            return;
+        };
+
+        for row in self.ivars().device_row_views.borrow_mut().drain(..) {
+            row.removeFromSuperview();
+        }
+
+        let devices = self.ivars().devices.borrow();
+        if devices.is_empty() {
+            let row = NSView::new(self.mtm());
+            row.setFrame(NSRect::new(
+                NSPoint::new(0.0, 430.0),
+                NSSize::new(216.0, 30.0),
+            ));
+            row.setAutoresizingMask(
+                NSAutoresizingMaskOptions::ViewMinYMargin
+                    | NSAutoresizingMaskOptions::ViewWidthSizable,
+            );
+            let label = NSTextField::labelWithString(ns_string!("未发现 MTP 设备"), self.mtm());
+            label.setFrame(NSRect::new(
+                NSPoint::new(6.0, 5.0),
+                NSSize::new(204.0, 20.0),
+            ));
+            label.setFont(Some(&NSFont::systemFontOfSize(13.0)));
+            label.setTextColor(Some(&NSColor::secondaryLabelColor()));
+            row.addSubview(&label);
+            device_list.addSubview(&row);
+            self.ivars().device_row_views.borrow_mut().push(row);
+            return;
+        }
+
+        let current_location = *self.ivars().current_device_location.borrow();
+        let mounted_location = *self.ivars().current_mount_location.borrow();
+        let mounting_location = *self.ivars().current_mounting_location.borrow();
+        let controls_enabled = self.ivars().active_copies.load(Ordering::SeqCst) == 0;
+
+        for (index, device) in devices.iter().enumerate() {
+            let y = 430.0 - (index as f64 * 40.0);
+            let row = NSView::new(self.mtm());
+            row.setFrame(NSRect::new(NSPoint::new(0.0, y), NSSize::new(216.0, 36.0)));
+            row.setAutoresizingMask(
+                NSAutoresizingMaskOptions::ViewMinYMargin
+                    | NSAutoresizingMaskOptions::ViewWidthSizable,
+            );
+
+            let title = if current_location == Some(device.location_id) {
+                format!("> {}", device.display())
+            } else {
+                device.display()
+            };
+            let select_button = unsafe {
+                NSButton::buttonWithTitle_target_action(
+                    &NSString::from_str(&title),
+                    Some(self),
+                    Some(sel!(selectDevice:)),
+                    self.mtm(),
+                )
+            };
+            select_button.setFrame(NSRect::new(
+                NSPoint::new(0.0, 3.0),
+                NSSize::new(118.0, 28.0),
+            ));
+            select_button.setBordered(false);
+            select_button.setTag((index + 1) as NSInteger);
+            select_button.setEnabled(controls_enabled);
+
+            let mount_button = unsafe {
+                NSButton::buttonWithTitle_target_action(
+                    ns_string!("挂载"),
+                    Some(self),
+                    Some(sel!(mountDevice:)),
+                    self.mtm(),
+                )
+            };
+            mount_button.setFrame(NSRect::new(
+                NSPoint::new(122.0, 4.0),
+                NSSize::new(44.0, 26.0),
+            ));
+            mount_button.setTag((index + 1) as NSInteger);
+            mount_button.setEnabled(
+                controls_enabled
+                    && mounted_location != Some(device.location_id)
+                    && mounting_location != Some(device.location_id),
+            );
+
+            let eject_button = unsafe {
+                NSButton::buttonWithTitle_target_action(
+                    ns_string!("推出"),
+                    Some(self),
+                    Some(sel!(ejectDevice:)),
+                    self.mtm(),
+                )
+            };
+            eject_button.setFrame(NSRect::new(
+                NSPoint::new(170.0, 4.0),
+                NSSize::new(44.0, 26.0),
+            ));
+            eject_button.setTag((index + 1) as NSInteger);
+            eject_button
+                .setEnabled(controls_enabled && mounted_location == Some(device.location_id));
+
+            row.addSubview(&select_button);
+            row.addSubview(&mount_button);
+            row.addSubview(&eject_button);
+            device_list.addSubview(&row);
+            self.ivars().device_row_views.borrow_mut().push(row);
         }
     }
 }

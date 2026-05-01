@@ -2,9 +2,10 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{DefinedClass, MainThreadOnly, sel};
 use objc2_app_kit::{
-    NSApplication, NSAutoresizingMaskOptions, NSColor, NSDragOperation, NSEventModifierFlags,
-    NSFont, NSLineBreakMode, NSMenu, NSMenuItem, NSOutlineView, NSPopUpButton, NSProgressIndicator,
-    NSScrollView, NSTableColumn, NSTableViewGridLineStyle, NSTableViewStyle, NSTextField, NSView,
+    NSApplication, NSAutoresizingMaskOptions, NSButton, NSColor, NSDragOperation,
+    NSEventModifierFlags, NSFont, NSLineBreakMode, NSMenu, NSMenuItem, NSOutlineView,
+    NSProgressIndicator, NSScrollView, NSTableColumn, NSTableViewGridLineStyle, NSTableViewStyle,
+    NSTextField, NSView,
 };
 use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize, NSString, ns_string};
 
@@ -12,21 +13,44 @@ use crate::app::Delegate;
 use crate::outline::PreviewOutlineView;
 
 pub fn build_browser_ui(delegate: &Delegate, mtm: MainThreadMarker, content: &NSView) {
-    let device_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("Devices"));
-    device_menu.setDelegate(Some(ProtocolObject::from_ref(delegate)));
-    let device_popup = unsafe {
-        NSPopUpButton::popUpButtonWithMenu_target_action(
-            &device_menu,
+    let sidebar = NSView::new(mtm);
+    sidebar.setFrame(NSRect::new(
+        NSPoint::new(0.0, 0.0),
+        NSSize::new(240.0, 560.0),
+    ));
+    sidebar.setAutoresizingMask(NSAutoresizingMaskOptions::ViewHeightSizable);
+
+    let refresh_button = unsafe {
+        NSButton::buttonWithTitle_target_action(
+            ns_string!("刷新"),
             Some(delegate),
-            Some(sel!(selectDevice:)),
+            Some(sel!(refreshDevices:)),
+            mtm,
         )
     };
-    device_popup.addItemWithTitle(ns_string!("请选择设备"));
-    device_popup.setFrame(NSRect::new(
-        NSPoint::new(12.0, 526.0),
-        NSSize::new(360.0, 26.0),
+    refresh_button.setFrame(NSRect::new(
+        NSPoint::new(12.0, 516.0),
+        NSSize::new(216.0, 30.0),
     ));
-    device_popup.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinYMargin);
+    refresh_button.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinYMargin);
+
+    let sidebar_title = NSTextField::labelWithString(ns_string!("设备"), mtm);
+    sidebar_title.setFrame(NSRect::new(
+        NSPoint::new(12.0, 486.0),
+        NSSize::new(216.0, 20.0),
+    ));
+    sidebar_title.setFont(Some(&NSFont::boldSystemFontOfSize(13.0)));
+    sidebar_title.setTextColor(Some(&NSColor::secondaryLabelColor()));
+    sidebar_title.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinYMargin);
+
+    let device_list = NSView::new(mtm);
+    device_list.setFrame(NSRect::new(
+        NSPoint::new(12.0, 12.0),
+        NSSize::new(216.0, 466.0),
+    ));
+    device_list.setAutoresizingMask(
+        NSAutoresizingMaskOptions::ViewHeightSizable | NSAutoresizingMaskOptions::ViewWidthSizable,
+    );
 
     let outline: Retained<NSOutlineView> = PreviewOutlineView::new(mtm).into_super();
     outline.setRowHeight(24.0);
@@ -55,11 +79,13 @@ pub fn build_browser_ui(delegate: &Delegate, mtm: MainThreadMarker, content: &NS
 
     let scroll = NSScrollView::new(mtm);
     scroll.setFrame(NSRect::new(
-        NSPoint::new(0.0, 0.0),
-        NSSize::new(640.0, 520.0),
+        NSPoint::new(240.0, 0.0),
+        NSSize::new(400.0, 560.0),
     ));
     scroll.setAutoresizingMask(
-        NSAutoresizingMaskOptions::ViewHeightSizable | NSAutoresizingMaskOptions::ViewWidthSizable,
+        NSAutoresizingMaskOptions::ViewHeightSizable
+            | NSAutoresizingMaskOptions::ViewWidthSizable
+            | NSAutoresizingMaskOptions::ViewMaxXMargin,
     );
     scroll.setHasVerticalScroller(true);
     scroll.setDocumentView(Some(&outline));
@@ -107,14 +133,18 @@ pub fn build_browser_ui(delegate: &Delegate, mtm: MainThreadMarker, content: &NS
         NSAutoresizingMaskOptions::ViewMinXMargin | NSAutoresizingMaskOptions::ViewMinYMargin,
     );
 
+    sidebar.addSubview(&refresh_button);
+    sidebar.addSubview(&sidebar_title);
+    sidebar.addSubview(&device_list);
+    content.addSubview(&sidebar);
     content.addSubview(&scroll);
-    content.addSubview(&device_popup);
     content.addSubview(&title);
     content.addSubview(&detail);
     content.addSubview(&progress);
 
     delegate.ivars().outline_view.set(outline).unwrap();
-    delegate.ivars().device_popup.set(device_popup).unwrap();
+    delegate.ivars().device_list_view.set(device_list).unwrap();
+    delegate.ivars().refresh_button.set(refresh_button).unwrap();
     delegate.ivars().title_label.set(title).unwrap();
     delegate.ivars().detail_label.set(detail).unwrap();
     delegate.ivars().progress_indicator.set(progress).unwrap();
