@@ -13,6 +13,7 @@ use crate::outline::PreviewOutlineView;
 
 pub fn build_browser_ui(delegate: &Delegate, mtm: MainThreadMarker, content: &NSView) {
     let device_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("Devices"));
+    device_menu.setDelegate(Some(ProtocolObject::from_ref(delegate)));
     let device_popup = unsafe {
         NSPopUpButton::popUpButtonWithMenu_target_action(
             &device_menu,
@@ -20,6 +21,7 @@ pub fn build_browser_ui(delegate: &Delegate, mtm: MainThreadMarker, content: &NS
             Some(sel!(selectDevice:)),
         )
     };
+    device_popup.addItemWithTitle(ns_string!("请选择设备"));
     device_popup.setFrame(NSRect::new(
         NSPoint::new(12.0, 526.0),
         NSSize::new(360.0, 26.0),

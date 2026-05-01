@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use block2::RcBlock;
 use mtp_rs::mtp::{MtpDevice, MtpDeviceInfo};
-use mtp_rs::{ObjectHandle, StorageId};
+use mtp_rs::{ObjectHandle, OperationCode, StorageId};
 use objc2_quartz as _;
 
 use objc2::rc::Retained;
@@ -17,14 +17,14 @@ use objc2::runtime::{AnyClass, AnyObject, ProtocolObject};
 use objc2::{AnyThread, DefinedClass, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSBackingStoreType,
-    NSColor, NSControlTextEditingDelegate, NSDragOperation, NSDraggingSession,
-    NSFilePromiseProvider, NSFilePromiseProviderDelegate, NSFont, NSOutlineView,
-    NSOutlineViewDataSource, NSOutlineViewDelegate, NSPasteboard, NSPasteboardWriting,
-    NSPopUpButton, NSProgressIndicator, NSTableColumn, NSTextField, NSView, NSWindow,
-    NSWindowDelegate, NSWindowStyleMask,
+    NSColor, NSControlTextEditingDelegate, NSDragOperation, NSDraggingSession, NSEvent,
+    NSFilePromiseProvider, NSFilePromiseProviderDelegate, NSFont, NSMenu, NSMenuDelegate,
+    NSOutlineView, NSOutlineViewDataSource, NSOutlineViewDelegate, NSPasteboard,
+    NSPasteboardWriting, NSPopUpButton, NSProgressIndicator, NSTableColumn, NSTextField, NSView,
+    NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{
-    MainThreadMarker, NSArray, NSError, NSInteger, NSNotification, NSNumber, NSObject,
+    MainThreadMarker, NSArray, NSError, NSIndexSet, NSInteger, NSNotification, NSNumber, NSObject,
     NSObjectProtocol, NSOperationQueue, NSPoint, NSRect, NSSize, NSString, NSTimer, NSURL,
     ns_string,
 };
@@ -51,6 +51,7 @@ pub(crate) struct AppDelegateIvars {
     runtime: OnceCell<Runtime>,
     devices: RefCell<Vec<MtpDeviceInfo>>,
     device: RefCell<Option<MtpDevice>>,
+    current_device_location: RefCell<Option<u64>>,
     nodes: RefCell<Vec<BrowserNode>>,
     root_children: RefCell<Vec<usize>>,
     mtp_lock: Arc<Mutex<()>>,
@@ -146,7 +147,7 @@ define_class!(
             build_browser_ui(self, mtm, &content);
             install_main_menu(&app, self, mtm);
             self.install_copy_event_timer();
-            self.refresh_devices();
+            self.show_initial_device_prompt();
 
             window.center();
             window.makeKeyAndOrderFront(None);
@@ -163,6 +164,7 @@ define_class!(
     unsafe impl NSWindowDelegate for Delegate {
         #[unsafe(method(windowWillClose:))]
         fn window_will_close(&self, _notification: &NSNotification) {
+            self.close_current_device();
             NSApplication::sharedApplication(self.mtm()).terminate(None);
         }
     }
@@ -170,6 +172,7 @@ define_class!(
     unsafe impl NSOutlineViewDataSource for Delegate {}
     unsafe impl NSControlTextEditingDelegate for Delegate {}
     unsafe impl NSOutlineViewDelegate for Delegate {}
+    unsafe impl NSMenuDelegate for Delegate {}
 
     unsafe impl NSFilePromiseProviderDelegate for Delegate {
         #[unsafe(method(filePromiseProvider:fileNameForType:))]
@@ -340,6 +343,17 @@ define_class!(
             self.select_current_device();
         }
 
+        #[unsafe(method(menuWillOpen:))]
+        fn menu_will_open(&self, menu: &NSMenu) {
+            if !self.is_device_popup_menu(menu) {
+                return;
+            }
+            if self.reject_mtp_while_copying("正在复制文件，暂时不能刷新设备。") {
+                return;
+            }
+            self.refresh_devices();
+        }
+
         #[unsafe(method(drainCopyEvents:))]
         fn drain_copy_events_action(&self, _timer: &NSTimer) {
             self.drain_copy_events();
@@ -385,6 +399,15 @@ define_class!(
             };
             let ns_path = NSString::from_str(&path.to_string_lossy());
             Retained::autorelease_return(NSURL::fileURLWithPath(&ns_path))
+        }
+
+        #[unsafe(method(previewPanel:handleEvent:))]
+        fn preview_panel_handle_event(&self, panel: &AnyObject, event: &NSEvent) -> bool {
+            match event.keyCode() {
+                125 => self.select_preview_file_relative(panel, 1),
+                126 => self.select_preview_file_relative(panel, -1),
+                _ => false,
+            }
         }
 
         #[unsafe(method(outlineView:pasteboardWriterForItem:))]
@@ -456,6 +479,42 @@ impl Delegate {
         unsafe { msg_send![super(this), init] }
     }
 
+    fn show_initial_device_prompt(&self) {
+        if let Some(popup) = self.ivars().device_popup.get() {
+            popup.removeAllItems();
+            popup.addItemWithTitle(ns_string!("请选择设备"));
+        }
+        self.set_message("请选择设备", "点击左上角设备菜单扫描并选择一个 MTP 设备。");
+    }
+
+    fn clear_browser_state(&self) {
+        self.ivars().nodes.borrow_mut().clear();
+        self.ivars().root_children.borrow_mut().clear();
+        self.reload_outline();
+        self.update_detail();
+    }
+
+    fn close_current_device(&self) {
+        let device = self.ivars().device.borrow_mut().take();
+        self.ivars().current_device_location.borrow_mut().take();
+        if let Some(device) = device {
+            let _ = self.runtime().block_on(async {
+                device
+                    .session()
+                    .execute(OperationCode::CloseSession, &[])
+                    .await
+            });
+        }
+    }
+
+    fn is_device_popup_menu(&self, menu: &NSMenu) -> bool {
+        self.ivars()
+            .device_popup
+            .get()
+            .and_then(|popup| popup.menu())
+            .is_some_and(|popup_menu| std::ptr::eq(menu, popup_menu.as_ref()))
+    }
+
     fn item_index(&self, item: Option<&AnyObject>) -> Option<usize> {
         item.and_then(|item| item.downcast_ref::<NSNumber>())
             .map(NSNumber::as_usize)
@@ -489,6 +548,57 @@ impl Delegate {
 
     fn selected_file(&self) -> Option<BrowserNode> {
         self.selected_node().filter(BrowserNode::is_file)
+    }
+
+    fn selected_file_row(&self) -> Option<NSInteger> {
+        let outline = self.ivars().outline_view.get()?;
+        let row = outline.selectedRow();
+        if row < 0 {
+            return None;
+        }
+        self.node_index_at_row(row)
+            .and_then(|index| self.ivars().nodes.borrow().get(index).cloned())
+            .filter(BrowserNode::is_file)
+            .map(|_| row)
+    }
+
+    fn node_index_at_row(&self, row: NSInteger) -> Option<usize> {
+        let outline = self.ivars().outline_view.get()?;
+        if row < 0 || row >= outline.numberOfRows() {
+            return None;
+        }
+        let item = outline.itemAtRow(row)?;
+        self.item_index(Some(&item))
+    }
+
+    fn is_file_row(&self, row: NSInteger) -> bool {
+        self.node_index_at_row(row)
+            .and_then(|index| self.ivars().nodes.borrow().get(index).cloned())
+            .is_some_and(|node| node.is_file())
+    }
+
+    fn select_preview_file_relative(&self, panel: &AnyObject, direction: NSInteger) -> bool {
+        let Some(outline) = self.ivars().outline_view.get() else {
+            return false;
+        };
+        let Some(current_row) = self.selected_file_row() else {
+            return false;
+        };
+        let row_count = outline.numberOfRows();
+        let mut row = current_row + direction;
+        while row >= 0 && row < row_count {
+            if self.is_file_row(row) {
+                let indexes = NSIndexSet::indexSetWithIndex(row as usize);
+                outline.selectRowIndexes_byExtendingSelection(&indexes, false);
+                outline.scrollRowToVisible(row);
+                unsafe {
+                    let _: () = msg_send![panel, reloadData];
+                }
+                return true;
+            }
+            row += direction;
+        }
+        false
     }
 
     fn node_indexes_from_items(&self, items: &NSArray) -> Vec<usize> {
@@ -600,6 +710,7 @@ impl Delegate {
         let result = MtpDevice::list_devices();
         let mut devices = self.ivars().devices.borrow_mut();
         devices.clear();
+        let current_location = *self.ivars().current_device_location.borrow();
 
         let Some(popup) = self.ivars().device_popup.get() else {
             return;
@@ -609,29 +720,41 @@ impl Delegate {
         match result {
             Ok(found) if found.is_empty() => {
                 popup.addItemWithTitle(ns_string!("未发现 MTP 设备"));
+                if current_location.is_some() {
+                    self.close_current_device();
+                    self.clear_browser_state();
+                }
                 self.set_message(
                     "未发现 MTP 设备",
                     "连接 Android/Kindle 等 MTP 设备后点击菜单 Device -> Refresh Devices。",
                 );
             }
             Ok(found) => {
-                popup.addItemWithTitle(ns_string!("选择 MTP 设备..."));
+                popup.addItemWithTitle(ns_string!("请选择设备"));
                 for device in &found {
                     popup.addItemWithTitle(&NSString::from_str(&device.display()));
                 }
+                if let Some(current_location) = current_location {
+                    if let Some(index) = found
+                        .iter()
+                        .position(|device| device.location_id == current_location)
+                    {
+                        popup.selectItemAtIndex((index + 1) as NSInteger);
+                    } else {
+                        self.close_current_device();
+                        self.clear_browser_state();
+                    }
+                }
                 *devices = found;
-                self.set_message("请选择设备", "从左上角设备菜单选择一个 MTP 设备。");
+                if current_location.is_none() {
+                    self.set_message("请选择设备", "从左上角设备菜单选择一个 MTP 设备。");
+                }
             }
             Err(err) => {
                 popup.addItemWithTitle(ns_string!("设备扫描失败"));
                 self.set_message("设备扫描失败", &format!("{err}"));
             }
         }
-
-        self.ivars().device.borrow_mut().take();
-        self.ivars().nodes.borrow_mut().clear();
-        self.ivars().root_children.borrow_mut().clear();
-        self.reload_outline();
     }
 
     fn select_current_device(&self) {
@@ -647,6 +770,15 @@ impl Delegate {
             None => return,
         };
 
+        if self.ivars().device.borrow().is_some()
+            && *self.ivars().current_device_location.borrow() == Some(device_info.location_id)
+        {
+            self.load_storages();
+            return;
+        }
+
+        self.close_current_device();
+        self.clear_browser_state();
         self.set_message("正在连接设备", &device_info.display());
         let result = self
             .runtime()
@@ -655,14 +787,16 @@ impl Delegate {
         match result {
             Ok(device) => {
                 self.ivars().device.replace(Some(device));
+                self.ivars()
+                    .current_device_location
+                    .replace(Some(device_info.location_id));
                 self.load_storages();
             }
             Err(err) => {
                 self.ivars().device.borrow_mut().take();
+                self.ivars().current_device_location.borrow_mut().take();
                 self.set_message("连接设备失败", &format_mtp_error(&err));
-                self.ivars().nodes.borrow_mut().clear();
-                self.ivars().root_children.borrow_mut().clear();
-                self.reload_outline();
+                self.clear_browser_state();
             }
         }
     }
