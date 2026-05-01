@@ -1,26 +1,32 @@
 use std::cell::{OnceCell, RefCell};
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
+use std::time::{Duration, Instant};
 
+use block2::RcBlock;
 use mtp_rs::mtp::{MtpDevice, MtpDeviceInfo};
 use mtp_rs::{ObjectHandle, StorageId};
 use objc2_quartz as _;
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, ProtocolObject};
-use objc2::{AnyThread, DefinedClass, MainThreadOnly, define_class, msg_send};
+use objc2::{AnyThread, DefinedClass, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSBackingStoreType,
     NSColor, NSControlTextEditingDelegate, NSDragOperation, NSDraggingSession,
     NSFilePromiseProvider, NSFilePromiseProviderDelegate, NSFont, NSOutlineView,
     NSOutlineViewDataSource, NSOutlineViewDelegate, NSPasteboard, NSPasteboardWriting,
-    NSPopUpButton, NSTableColumn, NSTextField, NSView, NSWindow, NSWindowDelegate,
-    NSWindowStyleMask,
+    NSPopUpButton, NSProgressIndicator, NSTableColumn, NSTextField, NSView, NSWindow,
+    NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{
     MainThreadMarker, NSArray, NSError, NSInteger, NSNotification, NSNumber, NSObject,
-    NSObjectProtocol, NSOperationQueue, NSPoint, NSRect, NSSize, NSString, NSURL, ns_string,
+    NSObjectProtocol, NSOperationQueue, NSPoint, NSRect, NSSize, NSString, NSTimer, NSURL,
+    ns_string,
 };
 use tokio::runtime::{Builder, Runtime};
 
@@ -29,10 +35,10 @@ use crate::ui::{build_browser_ui, install_main_menu};
 use crate::util::{format_bytes, format_mtp_error, sanitize_filename};
 
 const DRAG_NODE_PREFIX: &str = "macmtp-node:";
-const DRAG_MTP_TIMEOUT: Duration = Duration::from_secs(8);
 const FILE_PROMISE_TYPE_FILE: &str = "public.data";
 const FILE_PROMISE_TYPE_FOLDER: &str = "public.folder";
 const FILE_PROMISE_ERROR_DOMAIN: &str = "MacMTPFilePromiseError";
+const COPY_PROGRESS_THROTTLE: Duration = Duration::from_millis(120);
 
 #[derive(Default)]
 pub(crate) struct AppDelegateIvars {
@@ -41,11 +47,54 @@ pub(crate) struct AppDelegateIvars {
     pub(crate) device_popup: OnceCell<Retained<NSPopUpButton>>,
     pub(crate) title_label: OnceCell<Retained<NSTextField>>,
     pub(crate) detail_label: OnceCell<Retained<NSTextField>>,
+    pub(crate) progress_indicator: OnceCell<Retained<NSProgressIndicator>>,
     runtime: OnceCell<Runtime>,
     devices: RefCell<Vec<MtpDeviceInfo>>,
     device: RefCell<Option<MtpDevice>>,
     nodes: RefCell<Vec<BrowserNode>>,
     root_children: RefCell<Vec<usize>>,
+    mtp_lock: Arc<Mutex<()>>,
+    active_copies: Arc<AtomicUsize>,
+    copy_events_tx: OnceCell<mpsc::Sender<CopyEvent>>,
+    copy_events_rx: RefCell<Option<mpsc::Receiver<CopyEvent>>>,
+    copy_error: RefCell<Option<String>>,
+    copy_timer: OnceCell<Retained<NSTimer>>,
+}
+
+#[derive(Clone)]
+struct ExportNode {
+    name: String,
+    storage_id: StorageId,
+    handle: ObjectHandle,
+    is_folder: bool,
+}
+
+enum CopyEvent {
+    Started,
+    Progress {
+        name: String,
+        bytes_done: u64,
+        bytes_total: Option<u64>,
+        files_done: usize,
+    },
+    Finished {
+        result: Result<(), String>,
+    },
+}
+
+struct SendCompletion(RcBlock<dyn Fn(*mut NSError)>);
+
+unsafe impl Send for SendCompletion {}
+
+impl SendCompletion {
+    fn call_success(&self) {
+        self.0.call((std::ptr::null_mut(),));
+    }
+
+    fn call_error(&self, message: &str) {
+        let error = promise_error(message);
+        self.0.call((Retained::autorelease_return(error),));
+    }
 }
 
 define_class!(
@@ -96,6 +145,7 @@ define_class!(
             let content = window.contentView().expect("window must have a content view");
             build_browser_ui(self, mtm, &content);
             install_main_menu(&app, self, mtm);
+            self.install_copy_event_timer();
             self.refresh_devices();
 
             window.center();
@@ -148,17 +198,12 @@ define_class!(
             url: &NSURL,
             completion_handler: &block2::DynBlock<dyn Fn(*mut NSError)>,
         ) {
-            let result = self.write_file_promise(file_promise_provider, url);
-            match result {
-                Ok(()) => {
-                    self.set_message("拖拽复制完成", "文件已复制到目标位置。");
-                    completion_handler.call((std::ptr::null_mut(),));
-                }
-                Err(message) => {
-                    self.set_message("拖拽复制失败", &message);
-                    let error = promise_error(&message);
-                    completion_handler.call((Retained::autorelease_return(error),));
-                }
+            if let Err(message) =
+                self.start_file_promise_copy(file_promise_provider, url, completion_handler.copy())
+            {
+                self.set_message("拖拽复制失败", &message);
+                let error = promise_error(&message);
+                completion_handler.call((Retained::autorelease_return(error),));
             }
         }
 
@@ -216,6 +261,9 @@ define_class!(
 
         #[unsafe(method(outlineView:shouldExpandItem:))]
         fn outline_should_expand_item(&self, outline_view: &NSOutlineView, item: &AnyObject) -> bool {
+            if self.reject_mtp_while_copying("正在复制文件，暂时不能读取目录。") {
+                return false.into();
+            }
             if let Some(index) = self.item_index(Some(item)) {
                 self.load_children(index);
                 unsafe { outline_view.reloadItem_reloadChildren(Some(item), true) };
@@ -270,21 +318,38 @@ define_class!(
 
         #[unsafe(method(showQuickLook:))]
         fn show_quick_look(&self, _sender: Option<&AnyObject>) {
+            if self.reject_mtp_while_copying("正在复制文件，暂时不能预览。") {
+                return;
+            }
             self.open_quick_look_panel();
         }
 
         #[unsafe(method(refreshDevices:))]
         fn refresh_devices_action(&self, _sender: Option<&AnyObject>) {
+            if self.reject_mtp_while_copying("正在复制文件，暂时不能刷新设备。") {
+                return;
+            }
             self.refresh_devices();
         }
 
         #[unsafe(method(selectDevice:))]
         fn select_device_action(&self, _sender: Option<&AnyObject>) {
+            if self.reject_mtp_while_copying("正在复制文件，暂时不能切换设备。") {
+                return;
+            }
             self.select_current_device();
+        }
+
+        #[unsafe(method(drainCopyEvents:))]
+        fn drain_copy_events_action(&self, _timer: &NSTimer) {
+            self.drain_copy_events();
         }
 
         #[unsafe(method(acceptsPreviewPanelControl:))]
         fn accepts_preview_panel_control(&self, _panel: &AnyObject) -> bool {
+            if self.ivars().active_copies.load(Ordering::SeqCst) > 0 {
+                return false.into();
+            }
             self.selected_file().is_some()
         }
 
@@ -823,10 +888,11 @@ impl Delegate {
         }
     }
 
-    fn write_file_promise(
+    fn start_file_promise_copy(
         &self,
         provider: &NSFilePromiseProvider,
         url: &NSURL,
+        completion_handler: RcBlock<dyn Fn(*mut NSError)>,
     ) -> Result<(), String> {
         let index = self
             .file_promise_index(provider)
@@ -835,90 +901,72 @@ impl Delegate {
             .path()
             .map(|path| PathBuf::from(path.to_string()))
             .ok_or_else(|| "Finder 没有提供有效目标路径。".to_string())?;
-
-        self.set_message("正在复制拖拽项目", "正在从 MTP 设备复制到目标位置。");
-        self.export_node_to_path(index, &path)
-    }
-
-    fn export_node_to_path(&self, index: usize, path: &PathBuf) -> Result<(), String> {
-        let node = self
-            .ivars()
-            .nodes
-            .borrow()
-            .get(index)
-            .cloned()
-            .ok_or_else(|| "找不到要复制的项目。".to_string())?;
-
-        match node.source {
-            NodeSource::Object {
-                storage_id,
-                handle,
-                is_folder: false,
-            } => self.export_file_to_path(storage_id, handle, path),
-            NodeSource::Object {
-                is_folder: true, ..
-            } => self.export_folder_to_path(index, path),
-            _ => Err("只能拖拽 MTP 文件或文件夹。".to_string()),
-        }
-    }
-
-    fn export_file_to_path(
-        &self,
-        storage_id: StorageId,
-        handle: ObjectHandle,
-        path: &PathBuf,
-    ) -> Result<(), String> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|err| format!("无法创建目标目录: {err}"))?;
-        }
+        let job = self
+            .export_node(index)
+            .ok_or_else(|| "只能拖拽 MTP 文件或文件夹。".to_string())?;
         let device = self
             .ivars()
             .device
             .borrow()
             .clone()
             .ok_or_else(|| "设备未连接。".to_string())?;
-        let data = self
-            .runtime()
-            .block_on(async {
-                let operation = async {
-                    let storage = device.storage(storage_id).await?;
-                    storage.download(handle).await
-                };
-                tokio::time::timeout(DRAG_MTP_TIMEOUT, operation)
-                    .await
-                    .map_err(|_| format!("MTP 文件下载超过 {} 秒。", DRAG_MTP_TIMEOUT.as_secs()))?
-                    .map_err(|err| format_mtp_error(&err))
-            })
-            .map_err(|message| message)?;
+        let tx = self
+            .ivars()
+            .copy_events_tx
+            .get()
+            .cloned()
+            .ok_or_else(|| "复制进度通道未初始化。".to_string())?;
+        let mtp_lock = self.ivars().mtp_lock.clone();
+        let active_copies = self.ivars().active_copies.clone();
+        if active_copies.load(Ordering::SeqCst) == 0 {
+            *self.ivars().copy_error.borrow_mut() = None;
+        }
+        active_copies.fetch_add(1, Ordering::SeqCst);
 
-        fs::write(path, data).map_err(|err| format!("无法写入文件: {err}"))
+        self.set_message("正在复制拖拽项目", "正在从 MTP 设备复制到目标位置。");
+        self.show_copy_progress(true);
+        self.set_mtp_controls_enabled(false);
+        let _ = tx.send(CopyEvent::Started);
+        let completion_handler = SendCompletion(completion_handler);
+        thread::spawn(move || {
+            let result = run_copy_worker(device, mtp_lock, job, path, tx.clone());
+            active_copies.fetch_sub(1, Ordering::SeqCst);
+            let _ = tx.send(CopyEvent::Finished {
+                result: result.clone(),
+            });
+            match result {
+                Ok(()) => completion_handler.call_success(),
+                Err(message) => completion_handler.call_error(&message),
+            }
+        });
+        Ok(())
     }
 
-    fn export_folder_to_path(&self, index: usize, path: &PathBuf) -> Result<(), String> {
-        self.load_children_result(index, Some(DRAG_MTP_TIMEOUT))?;
-        fs::create_dir_all(path).map_err(|err| format!("无法创建文件夹: {err}"))?;
+    fn export_node(&self, index: usize) -> Option<ExportNode> {
+        let nodes = self.ivars().nodes.borrow();
+        let node = nodes.get(index)?;
+        let NodeSource::Object {
+            storage_id,
+            handle,
+            is_folder,
+        } = node.source
+        else {
+            return None;
+        };
+        Some(ExportNode {
+            name: node.name.clone(),
+            storage_id,
+            handle,
+            is_folder,
+        })
+    }
 
-        let children = self
-            .ivars()
-            .nodes
-            .borrow()
-            .get(index)
-            .map(|node| node.children.clone())
-            .unwrap_or_default();
-        for child in children {
-            let child_name = self
-                .ivars()
-                .nodes
-                .borrow()
-                .get(child)
-                .map(|node| sanitize_filename(&node.name));
-            let Some(child_name) = child_name else {
-                continue;
-            };
-            let child_path = unique_child_path(path, &child_name);
-            self.export_node_to_path(child, &child_path)?;
+    fn reject_mtp_while_copying(&self, detail: &str) -> bool {
+        if self.ivars().active_copies.load(Ordering::SeqCst) == 0 {
+            return false;
         }
-        Ok(())
+        self.set_message("MTP 正在复制", detail);
+        true
     }
 
     fn runtime(&self) -> &Runtime {
@@ -937,6 +985,120 @@ impl Delegate {
         }
         if let Some(label) = self.ivars().detail_label.get() {
             label.setStringValue(&NSString::from_str(detail));
+        }
+    }
+
+    fn install_copy_event_timer(&self) {
+        let (tx, rx) = mpsc::channel();
+        self.ivars().copy_events_tx.set(tx).ok();
+        *self.ivars().copy_events_rx.borrow_mut() = Some(rx);
+        let timer = unsafe {
+            NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
+                0.1,
+                self,
+                sel!(drainCopyEvents:),
+                None,
+                true,
+            )
+        };
+        self.ivars().copy_timer.set(timer).ok();
+    }
+
+    fn drain_copy_events(&self) {
+        let mut last_progress = None;
+        let mut last_result = None;
+        if let Some(rx) = self.ivars().copy_events_rx.borrow_mut().as_mut() {
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    CopyEvent::Started => {
+                        self.show_copy_progress(true);
+                        self.set_mtp_controls_enabled(false);
+                    }
+                    CopyEvent::Progress {
+                        name,
+                        bytes_done,
+                        bytes_total,
+                        files_done,
+                    } => {
+                        last_progress = Some((name, bytes_done, bytes_total, files_done));
+                    }
+                    CopyEvent::Finished { result } => {
+                        last_result = Some(result);
+                    }
+                }
+            }
+        }
+
+        if let Some((name, bytes_done, bytes_total, files_done)) = last_progress {
+            self.update_copy_progress(&name, bytes_done, bytes_total, files_done);
+        }
+        if let Some(result) = last_result {
+            if let Err(message) = &result {
+                *self.ivars().copy_error.borrow_mut() = Some(message.clone());
+            }
+            if self.ivars().active_copies.load(Ordering::SeqCst) == 0 {
+                self.show_copy_progress(false);
+                self.set_mtp_controls_enabled(true);
+                if let Some(message) = self.ivars().copy_error.borrow_mut().take() {
+                    self.set_message("拖拽复制失败", &message);
+                } else if result.is_ok() {
+                    self.set_message("拖拽复制完成", "文件已复制到目标位置。");
+                }
+            }
+        }
+    }
+
+    fn update_copy_progress(
+        &self,
+        name: &str,
+        bytes_done: u64,
+        bytes_total: Option<u64>,
+        files_done: usize,
+    ) {
+        if let Some(progress) = self.ivars().progress_indicator.get() {
+            match bytes_total {
+                Some(total) if total > 0 => {
+                    progress.setIndeterminate(false);
+                    progress.setDoubleValue((bytes_done as f64 / total as f64) * 100.0);
+                }
+                _ => {
+                    progress.setIndeterminate(true);
+                    unsafe { progress.startAnimation(None) };
+                }
+            }
+        }
+        let detail = match bytes_total {
+            Some(total) if total > 0 => format!(
+                "{}\n已完成 {} / {}，共 {} 个文件。",
+                name,
+                format_bytes(bytes_done),
+                format_bytes(total),
+                files_done
+            ),
+            _ => format!("{}\n已复制 {} 个文件。", name, files_done),
+        };
+        self.set_message("正在复制拖拽项目", &detail);
+    }
+
+    fn show_copy_progress(&self, visible: bool) {
+        if let Some(progress) = self.ivars().progress_indicator.get() {
+            progress.setHidden(!visible);
+            if visible {
+                progress.setDoubleValue(0.0);
+            } else {
+                progress.setIndeterminate(false);
+                progress.setDoubleValue(0.0);
+                unsafe { progress.stopAnimation(None) };
+            }
+        }
+    }
+
+    fn set_mtp_controls_enabled(&self, enabled: bool) {
+        if let Some(popup) = self.ivars().device_popup.get() {
+            popup.setEnabled(enabled);
+        }
+        if let Some(outline) = self.ivars().outline_view.get() {
+            outline.setEnabled(enabled);
         }
     }
 }
@@ -964,6 +1126,131 @@ fn unique_child_path(parent: &PathBuf, name: &str) -> PathBuf {
         }
     }
     unreachable!()
+}
+
+fn run_copy_worker(
+    device: MtpDevice,
+    mtp_lock: Arc<Mutex<()>>,
+    node: ExportNode,
+    path: PathBuf,
+    tx: mpsc::Sender<CopyEvent>,
+) -> Result<(), String> {
+    let _guard = mtp_lock
+        .lock()
+        .map_err(|_| "MTP 操作锁已损坏。".to_string())?;
+    let runtime = Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| format!("无法创建复制运行时: {err}"))?;
+    let mut state = CopyState {
+        files_done: 0,
+        last_progress: Instant::now() - COPY_PROGRESS_THROTTLE,
+        tx,
+    };
+    runtime.block_on(async { export_node_worker(&device, &node, &path, &mut state).await })
+}
+
+struct CopyState {
+    files_done: usize,
+    last_progress: Instant,
+    tx: mpsc::Sender<CopyEvent>,
+}
+
+async fn export_node_worker(
+    device: &MtpDevice,
+    node: &ExportNode,
+    path: &PathBuf,
+    state: &mut CopyState,
+) -> Result<(), String> {
+    if node.is_folder {
+        export_folder_worker(device, node, path, state).await
+    } else {
+        export_file_worker(device, node, path, state).await
+    }
+}
+
+async fn export_file_worker(
+    device: &MtpDevice,
+    node: &ExportNode,
+    path: &PathBuf,
+    state: &mut CopyState,
+) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| format!("无法创建目标目录: {err}"))?;
+    }
+
+    let storage = device
+        .storage(node.storage_id)
+        .await
+        .map_err(|err| format_mtp_error(&err))?;
+    let mut download = storage
+        .download_stream(node.handle)
+        .await
+        .map_err(|err| format_mtp_error(&err))?;
+    let total = download.size();
+    let mut file = fs::File::create(path).map_err(|err| format!("无法写入文件: {err}"))?;
+
+    while let Some(chunk) = download.next_chunk().await {
+        let chunk = chunk.map_err(|err| format_mtp_error(&err))?;
+        file.write_all(&chunk)
+            .map_err(|err| format!("无法写入文件: {err}"))?;
+        if state.last_progress.elapsed() >= COPY_PROGRESS_THROTTLE {
+            state.last_progress = Instant::now();
+            let _ = state.tx.send(CopyEvent::Progress {
+                name: node.name.clone(),
+                bytes_done: download.bytes_received(),
+                bytes_total: Some(total),
+                files_done: state.files_done,
+            });
+        }
+    }
+    file.flush().map_err(|err| format!("无法写入文件: {err}"))?;
+    state.files_done += 1;
+    let _ = state.tx.send(CopyEvent::Progress {
+        name: node.name.clone(),
+        bytes_done: total,
+        bytes_total: Some(total),
+        files_done: state.files_done,
+    });
+    Ok(())
+}
+
+async fn export_folder_worker(
+    device: &MtpDevice,
+    node: &ExportNode,
+    path: &PathBuf,
+    state: &mut CopyState,
+) -> Result<(), String> {
+    fs::create_dir_all(path).map_err(|err| format!("无法创建文件夹: {err}"))?;
+    let _ = state.tx.send(CopyEvent::Progress {
+        name: node.name.clone(),
+        bytes_done: 0,
+        bytes_total: None,
+        files_done: state.files_done,
+    });
+
+    let storage = device
+        .storage(node.storage_id)
+        .await
+        .map_err(|err| format_mtp_error(&err))?;
+    let children = storage
+        .list_objects(Some(node.handle))
+        .await
+        .map_err(|err| format_mtp_error(&err))?;
+
+    for child in children {
+        let is_folder = child.is_folder();
+        let child_name = sanitize_filename(&child.filename);
+        let child_path = unique_child_path(path, &child_name);
+        let child_node = ExportNode {
+            name: child.filename,
+            storage_id: node.storage_id,
+            handle: child.handle,
+            is_folder,
+        };
+        Box::pin(export_node_worker(device, &child_node, &child_path, state)).await?;
+    }
+    Ok(())
 }
 
 fn promise_error(message: &str) -> Retained<NSError> {

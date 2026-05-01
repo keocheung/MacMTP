@@ -3,8 +3,8 @@ use objc2::runtime::ProtocolObject;
 use objc2::{DefinedClass, MainThreadOnly, sel};
 use objc2_app_kit::{
     NSApplication, NSAutoresizingMaskOptions, NSColor, NSDragOperation, NSEventModifierFlags,
-    NSFont, NSMenu, NSMenuItem, NSOutlineView, NSPopUpButton, NSScrollView, NSTableColumn,
-    NSTableViewGridLineStyle, NSTableViewStyle, NSTextField, NSView,
+    NSFont, NSMenu, NSMenuItem, NSOutlineView, NSPopUpButton, NSProgressIndicator, NSScrollView,
+    NSTableColumn, NSTableViewGridLineStyle, NSTableViewStyle, NSTextField, NSView,
 };
 use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize, NSString, ns_string};
 
@@ -79,15 +79,29 @@ pub fn build_browser_ui(delegate: &Delegate, mtm: MainThreadMarker, content: &NS
     detail.setTextColor(Some(&NSColor::secondaryLabelColor()));
     detail.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinXMargin);
 
+    let progress = NSProgressIndicator::new(mtm);
+    progress.setFrame(NSRect::new(
+        NSPoint::new(666.0, 190.0),
+        NSSize::new(204.0, 18.0),
+    ));
+    progress.setIndeterminate(false);
+    progress.setMinValue(0.0);
+    progress.setMaxValue(100.0);
+    progress.setDoubleValue(0.0);
+    progress.setHidden(true);
+    progress.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinXMargin);
+
     content.addSubview(&scroll);
     content.addSubview(&device_popup);
     content.addSubview(&title);
     content.addSubview(&detail);
+    content.addSubview(&progress);
 
     delegate.ivars().outline_view.set(outline).unwrap();
     delegate.ivars().device_popup.set(device_popup).unwrap();
     delegate.ivars().title_label.set(title).unwrap();
     delegate.ivars().detail_label.set(detail).unwrap();
+    delegate.ivars().progress_indicator.set(progress).unwrap();
 }
 
 fn make_column(
