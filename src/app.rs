@@ -16,10 +16,10 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, ProtocolObject};
 use objc2::{AnyThread, DefinedClass, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSBackingStoreType,
-    NSColor, NSControlTextEditingDelegate, NSDragOperation, NSDraggingSession, NSEvent,
-    NSFilePromiseProvider, NSFilePromiseProviderDelegate, NSFont, NSMenu, NSMenuDelegate,
-    NSOutlineView, NSOutlineViewDataSource, NSOutlineViewDelegate, NSPasteboard,
+    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSAutoresizingMaskOptions,
+    NSBackingStoreType, NSColor, NSControlTextEditingDelegate, NSDragOperation, NSDraggingSession,
+    NSEvent, NSFilePromiseProvider, NSFilePromiseProviderDelegate, NSFont, NSLineBreakMode, NSMenu,
+    NSMenuDelegate, NSOutlineView, NSOutlineViewDataSource, NSOutlineViewDelegate, NSPasteboard,
     NSPasteboardWriting, NSPopUpButton, NSProgressIndicator, NSTableColumn, NSTextField, NSView,
     NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
@@ -300,18 +300,29 @@ define_class!(
                 node.name.clone()
             };
 
+            let width = _table_column.map(NSTableColumn::width).unwrap_or(320.0);
+            let container = NSView::new(self.mtm());
+            container.setFrame(NSRect::new(
+                NSPoint::new(0.0, 0.0),
+                NSSize::new(width, 24.0),
+            ));
+
             let field = NSTextField::labelWithString(&NSString::from_str(&text), self.mtm());
             field.setFont(Some(&NSFont::systemFontOfSize(14.0)));
+            field.setUsesSingleLineMode(true);
+            field.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
             if node.is_file() {
                 field.setTextColor(Some(&NSColor::labelColor()));
             } else {
                 field.setTextColor(Some(&NSColor::secondaryLabelColor()));
             }
             field.setFrame(NSRect::new(
-                NSPoint::new(6.0, 0.0),
-                NSSize::new(320.0, 24.0),
+                NSPoint::new(6.0, 2.0),
+                NSSize::new((width - 12.0).max(0.0), 20.0),
             ));
-            Retained::autorelease_return(field.into_super().into_super())
+            field.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
+            container.addSubview(&field);
+            Retained::autorelease_return(container)
         }
 
         #[unsafe(method(outlineViewSelectionDidChange:))]
@@ -498,11 +509,13 @@ impl Delegate {
         let device = self.ivars().device.borrow_mut().take();
         self.ivars().current_device_location.borrow_mut().take();
         if let Some(device) = device {
-            let _ = self.runtime().block_on(async {
-                device
-                    .session()
-                    .execute(OperationCode::CloseSession, &[])
-                    .await
+            let _ = self.with_mtp_lock(|| {
+                self.runtime().block_on(async {
+                    device
+                        .session()
+                        .execute(OperationCode::CloseSession, &[])
+                        .await
+                })
             });
         }
     }
@@ -707,7 +720,7 @@ impl Delegate {
     }
 
     fn refresh_devices(&self) {
-        let result = MtpDevice::list_devices();
+        let result = self.with_mtp_lock(MtpDevice::list_devices);
         let mut devices = self.ivars().devices.borrow_mut();
         devices.clear();
         let current_location = *self.ivars().current_device_location.borrow();
@@ -718,7 +731,11 @@ impl Delegate {
         popup.removeAllItems();
 
         match result {
-            Ok(found) if found.is_empty() => {
+            Err(message) => {
+                popup.addItemWithTitle(ns_string!("设备扫描失败"));
+                self.set_message("设备扫描失败", &message);
+            }
+            Ok(Ok(found)) if found.is_empty() => {
                 popup.addItemWithTitle(ns_string!("未发现 MTP 设备"));
                 if current_location.is_some() {
                     self.close_current_device();
@@ -729,7 +746,7 @@ impl Delegate {
                     "连接 Android/Kindle 等 MTP 设备后点击菜单 Device -> Refresh Devices。",
                 );
             }
-            Ok(found) => {
+            Ok(Ok(found)) => {
                 popup.addItemWithTitle(ns_string!("请选择设备"));
                 for device in &found {
                     popup.addItemWithTitle(&NSString::from_str(&device.display()));
@@ -750,7 +767,7 @@ impl Delegate {
                     self.set_message("请选择设备", "从左上角设备菜单选择一个 MTP 设备。");
                 }
             }
-            Err(err) => {
+            Ok(Err(err)) => {
                 popup.addItemWithTitle(ns_string!("设备扫描失败"));
                 self.set_message("设备扫描失败", &format!("{err}"));
             }
@@ -780,22 +797,29 @@ impl Delegate {
         self.close_current_device();
         self.clear_browser_state();
         self.set_message("正在连接设备", &device_info.display());
-        let result = self
-            .runtime()
-            .block_on(MtpDevice::open_by_location(device_info.location_id));
+        let result = self.with_mtp_lock(|| {
+            self.runtime()
+                .block_on(MtpDevice::open_by_location(device_info.location_id))
+        });
 
         match result {
-            Ok(device) => {
+            Ok(Ok(device)) => {
                 self.ivars().device.replace(Some(device));
                 self.ivars()
                     .current_device_location
                     .replace(Some(device_info.location_id));
                 self.load_storages();
             }
-            Err(err) => {
+            Ok(Err(err)) => {
                 self.ivars().device.borrow_mut().take();
                 self.ivars().current_device_location.borrow_mut().take();
                 self.set_message("连接设备失败", &format_mtp_error(&err));
+                self.clear_browser_state();
+            }
+            Err(message) => {
+                self.ivars().device.borrow_mut().take();
+                self.ivars().current_device_location.borrow_mut().take();
+                self.set_message("连接设备失败", &message);
                 self.clear_browser_state();
             }
         }
@@ -805,11 +829,16 @@ impl Delegate {
         let Some(device) = self.ivars().device.borrow().clone() else {
             return;
         };
-        let result = self.runtime().block_on(async { device.storages().await });
+        let result =
+            self.with_mtp_lock(|| self.runtime().block_on(async { device.storages().await }));
         let storages = match result {
-            Ok(storages) => storages,
-            Err(err) => {
+            Ok(Ok(storages)) => storages,
+            Ok(Err(err)) => {
                 self.set_message("读取存储失败", &format_mtp_error(&err));
+                return;
+            }
+            Err(message) => {
+                self.set_message("读取存储失败", &message);
                 return;
             }
         };
@@ -890,22 +919,25 @@ impl Delegate {
             }
         };
 
-        let result = self.runtime().block_on(async {
-            let operation = async {
-                let storage = device.storage(storage_id).await?;
-                storage.list_objects(parent).await
-            };
-            match timeout {
-                Some(timeout) => tokio::time::timeout(timeout, operation)
-                    .await
-                    .map_err(|_| format!("MTP 目录读取超过 {} 秒。", timeout.as_secs()))?
-                    .map_err(|err| format_mtp_error(&err)),
-                None => operation.await.map_err(|err| format_mtp_error(&err)),
-            }
+        let result = self.with_mtp_lock(|| {
+            self.runtime().block_on(async {
+                let operation = async {
+                    let storage = device.storage(storage_id).await?;
+                    storage.list_objects(parent).await
+                };
+                match timeout {
+                    Some(timeout) => tokio::time::timeout(timeout, operation)
+                        .await
+                        .map_err(|_| format!("MTP 目录读取超过 {} 秒。", timeout.as_secs()))?
+                        .map_err(|err| format_mtp_error(&err)),
+                    None => operation.await.map_err(|err| format_mtp_error(&err)),
+                }
+            })
         });
 
         let objects = match result {
-            Ok(objects) => objects,
+            Ok(Ok(objects)) => objects,
+            Ok(Err(message)) => return Err(message),
             Err(message) => return Err(message),
         };
 
@@ -964,14 +996,20 @@ impl Delegate {
 
         self.set_message("正在准备预览", "正在从 MTP 设备复制文件到临时目录。");
         let device = self.ivars().device.borrow().clone()?;
-        let result = self.runtime().block_on(async {
-            let storage = device.storage(storage_id).await?;
-            storage.download(handle).await
+        let result = self.with_mtp_lock(|| {
+            self.runtime().block_on(async {
+                let storage = device.storage(storage_id).await?;
+                storage.download(handle).await
+            })
         });
         let data = match result {
-            Ok(data) => data,
-            Err(err) => {
+            Ok(Ok(data)) => data,
+            Ok(Err(err)) => {
                 self.set_message("预览失败", &format_mtp_error(&err));
+                return None;
+            }
+            Err(message) => {
+                self.set_message("预览失败", &message);
                 return None;
             }
         };
@@ -1105,6 +1143,14 @@ impl Delegate {
 
     fn runtime(&self) -> &Runtime {
         self.ivars().runtime.get().expect("runtime initialized")
+    }
+
+    fn with_mtp_lock<T>(&self, operation: impl FnOnce() -> T) -> Result<T, String> {
+        let mtp_lock = self.ivars().mtp_lock.clone();
+        let _guard = mtp_lock
+            .lock()
+            .map_err(|_| "MTP 操作锁已损坏。".to_string())?;
+        Ok(operation())
     }
 
     fn reload_outline(&self) {

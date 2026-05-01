@@ -3,8 +3,8 @@ use objc2::runtime::ProtocolObject;
 use objc2::{DefinedClass, MainThreadOnly, sel};
 use objc2_app_kit::{
     NSApplication, NSAutoresizingMaskOptions, NSColor, NSDragOperation, NSEventModifierFlags,
-    NSFont, NSMenu, NSMenuItem, NSOutlineView, NSPopUpButton, NSProgressIndicator, NSScrollView,
-    NSTableColumn, NSTableViewGridLineStyle, NSTableViewStyle, NSTextField, NSView,
+    NSFont, NSLineBreakMode, NSMenu, NSMenuItem, NSOutlineView, NSPopUpButton, NSProgressIndicator,
+    NSScrollView, NSTableColumn, NSTableViewGridLineStyle, NSTableViewStyle, NSTextField, NSView,
 };
 use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize, NSString, ns_string};
 
@@ -26,7 +26,7 @@ pub fn build_browser_ui(delegate: &Delegate, mtm: MainThreadMarker, content: &NS
         NSPoint::new(12.0, 526.0),
         NSSize::new(360.0, 26.0),
     ));
-    device_popup.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMaxYMargin);
+    device_popup.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinYMargin);
 
     let outline: Retained<NSOutlineView> = PreviewOutlineView::new(mtm).into_super();
     outline.setRowHeight(24.0);
@@ -66,24 +66,36 @@ pub fn build_browser_ui(delegate: &Delegate, mtm: MainThreadMarker, content: &NS
 
     let title = NSTextField::labelWithString(ns_string!("未选择文件"), mtm);
     title.setFrame(NSRect::new(
-        NSPoint::new(664.0, 468.0),
-        NSSize::new(212.0, 40.0),
+        NSPoint::new(664.0, 430.0),
+        NSSize::new(212.0, 78.0),
     ));
     title.setFont(Some(&NSFont::boldSystemFontOfSize(18.0)));
-    title.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinXMargin);
+    title.setUsesSingleLineMode(false);
+    title.setLineBreakMode(NSLineBreakMode::ByWordWrapping);
+    title.setMaximumNumberOfLines(3);
+    title.setAutoresizingMask(
+        NSAutoresizingMaskOptions::ViewMinXMargin | NSAutoresizingMaskOptions::ViewMinYMargin,
+    );
 
     let detail = NSTextField::labelWithString(ns_string!(""), mtm);
     detail.setFrame(NSRect::new(
-        NSPoint::new(666.0, 228.0),
-        NSSize::new(204.0, 210.0),
+        NSPoint::new(666.0, 190.0),
+        NSSize::new(204.0, 218.0),
     ));
     detail.setFont(Some(&NSFont::systemFontOfSize(14.0)));
     detail.setTextColor(Some(&NSColor::secondaryLabelColor()));
-    detail.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinXMargin);
+    detail.setUsesSingleLineMode(false);
+    detail.setLineBreakMode(NSLineBreakMode::ByWordWrapping);
+    detail.setMaximumNumberOfLines(0);
+    detail.setAutoresizingMask(
+        NSAutoresizingMaskOptions::ViewMinXMargin
+            | NSAutoresizingMaskOptions::ViewMinYMargin
+            | NSAutoresizingMaskOptions::ViewHeightSizable,
+    );
 
     let progress = NSProgressIndicator::new(mtm);
     progress.setFrame(NSRect::new(
-        NSPoint::new(666.0, 190.0),
+        NSPoint::new(666.0, 160.0),
         NSSize::new(204.0, 18.0),
     ));
     progress.setIndeterminate(false);
@@ -91,7 +103,9 @@ pub fn build_browser_ui(delegate: &Delegate, mtm: MainThreadMarker, content: &NS
     progress.setMaxValue(100.0);
     progress.setDoubleValue(0.0);
     progress.setHidden(true);
-    progress.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinXMargin);
+    progress.setAutoresizingMask(
+        NSAutoresizingMaskOptions::ViewMinXMargin | NSAutoresizingMaskOptions::ViewMinYMargin,
+    );
 
     content.addSubview(&scroll);
     content.addSubview(&device_popup);
