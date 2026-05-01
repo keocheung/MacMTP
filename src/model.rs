@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use mtp_rs::ptp::DateTime;
 use mtp_rs::{ObjectHandle, StorageId};
 
 #[derive(Clone, Debug)]
@@ -7,6 +8,8 @@ pub struct BrowserNode {
     pub name: String,
     pub kind: String,
     pub size: String,
+    pub created: Option<DateTime>,
+    pub modified: Option<DateTime>,
     pub note: String,
     pub source: NodeSource,
     pub children: Vec<usize>,
@@ -55,6 +58,8 @@ pub fn message_node(title: &str, detail: &str) -> BrowserNode {
         name: title.to_string(),
         kind: "状态".to_string(),
         size: "--".to_string(),
+        created: None,
+        modified: None,
         note: detail.to_string(),
         source: NodeSource::Message,
         children: Vec::new(),

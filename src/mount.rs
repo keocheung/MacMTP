@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use fuser::{
     BackgroundSession, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
@@ -15,11 +15,11 @@ use fuser::{
     ReplyDirectory, ReplyEntry, ReplyOpen, Request,
 };
 use mtp_rs::mtp::{MtpDevice, MtpDeviceInfo};
-use mtp_rs::ptp::ObjectInfo;
+use mtp_rs::ptp::{DateTime, ObjectInfo};
 use mtp_rs::{ObjectHandle, StorageId};
 use tokio::runtime::Builder;
 
-use crate::util::{format_mtp_error, sanitize_filename};
+use crate::util::{format_mtp_error, mtp_datetime_to_system_time, sanitize_filename};
 
 const ROOT_INO: u64 = 1;
 const STORAGE_INO_BASE: u64 = 0x4000_0000_0000_0000;
@@ -179,6 +179,8 @@ struct FsEntry {
     name: OsString,
     kind: FsEntryKind,
     size: u64,
+    created: Option<DateTime>,
+    modified: Option<DateTime>,
 }
 
 #[derive(Clone)]
@@ -205,6 +207,8 @@ impl MtpFuseFs {
                 name: OsString::from(""),
                 kind: FsEntryKind::Root,
                 size: 0,
+                created: None,
+                modified: None,
             },
         );
         Self {
@@ -228,14 +232,16 @@ impl MtpFuseFs {
                     ..
                 }
         );
+        let modified = mtp_datetime_to_system_time(entry.modified.or(entry.created));
+        let created = mtp_datetime_to_system_time(entry.created.or(entry.modified));
         FileAttr {
             ino: INodeNo(entry.ino),
             size: if is_dir { 0 } else { entry.size },
             blocks: entry.size.div_ceil(512),
-            atime: SystemTime::UNIX_EPOCH,
-            mtime: SystemTime::UNIX_EPOCH,
-            ctime: SystemTime::UNIX_EPOCH,
-            crtime: SystemTime::UNIX_EPOCH,
+            atime: modified,
+            mtime: modified,
+            ctime: created,
+            crtime: created,
             kind: if is_dir {
                 FileType::Directory
             } else {
@@ -326,6 +332,8 @@ impl MtpFuseFs {
                         storage_id: storage.id(),
                     },
                     size: 0,
+                    created: None,
+                    modified: None,
                 }
             })
             .collect())
@@ -382,6 +390,8 @@ impl MtpFuseFs {
                 is_folder,
             },
             size: if is_folder { 0 } else { object.size },
+            created: object.created,
+            modified: object.modified,
         }
     }
 

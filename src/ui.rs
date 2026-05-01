@@ -69,12 +69,16 @@ pub fn build_browser_ui(delegate: &Delegate, mtm: MainThreadMarker, content: &NS
         outline.setDoubleAction(Some(sel!(showQuickLook:)));
     }
 
-    let name_column = make_column(mtm, "name", "名称", 360.0);
-    let kind_column = make_column(mtm, "kind", "类型", 150.0);
-    let size_column = make_column(mtm, "size", "大小", 110.0);
+    let name_column = make_column(mtm, "name", "名称", 300.0);
+    let kind_column = make_column(mtm, "kind", "类型", 80.0);
+    let size_column = make_column(mtm, "size", "大小", 90.0);
+    let created_column = make_column(mtm, "created", "添加时间", 150.0);
+    let modified_column = make_column(mtm, "modified", "修改时间", 150.0);
     outline.addTableColumn(&name_column);
     outline.addTableColumn(&kind_column);
     outline.addTableColumn(&size_column);
+    outline.addTableColumn(&created_column);
+    outline.addTableColumn(&modified_column);
     unsafe { outline.setOutlineTableColumn(Some(&name_column)) };
 
     let scroll = NSScrollView::new(mtm);
@@ -88,6 +92,7 @@ pub fn build_browser_ui(delegate: &Delegate, mtm: MainThreadMarker, content: &NS
             | NSAutoresizingMaskOptions::ViewMaxXMargin,
     );
     scroll.setHasVerticalScroller(true);
+    scroll.setHasHorizontalScroller(true);
     scroll.setDocumentView(Some(&outline));
 
     let title = NSTextField::labelWithString(ns_string!("未选择文件"), mtm);

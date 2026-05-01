@@ -34,7 +34,7 @@ use tokio::runtime::{Builder, Runtime};
 use crate::model::{BrowserNode, NodeSource, message_node};
 use crate::mount::{self, MountHandle};
 use crate::ui::{build_browser_ui, install_main_menu};
-use crate::util::{format_bytes, format_mtp_error, sanitize_filename};
+use crate::util::{format_bytes, format_mtp_datetime, format_mtp_error, sanitize_filename};
 
 const DRAG_NODE_PREFIX: &str = "macmtp-node:";
 const FILE_PROMISE_TYPE_FILE: &str = "public.data";
@@ -328,6 +328,10 @@ define_class!(
                 node.kind.to_string()
             } else if column_id == ns_string!("size") {
                 node.size.clone()
+            } else if column_id == ns_string!("created") {
+                format_mtp_datetime(node.created)
+            } else if column_id == ns_string!("modified") {
+                format_mtp_datetime(node.modified)
             } else {
                 node.name.clone()
             };
@@ -734,6 +738,10 @@ impl Delegate {
                 node.name.to_string(),
                 format!("{}\n{}\n\n{}", node.kind, node.size, node.note),
             ),
+            Some(node) if node.is_folder() => (
+                node.name.to_string(),
+                format!("{}\n{} 个项目\n\n{}", node.kind, node.children.len(), node.note),
+            ),
             Some(node) => (
                 node.name.to_string(),
                 format!(
@@ -1053,6 +1061,8 @@ impl Delegate {
                 } else {
                     format_bytes(object.size)
                 },
+                created: object.created,
+                modified: object.modified,
                 note: format!(
                     "Handle: {}\nStorage: {}\n选中文件按下空格预览文件。\n选中后拖拽到Finder可复制文件到本机。",
                     object.handle.0, storage_id.0
@@ -1522,12 +1532,22 @@ impl Delegate {
             row.removeFromSuperview();
         }
 
+        let bounds = device_list.bounds();
+        let list_width = bounds.size.width.max(0.0);
+        let list_height = bounds.size.height.max(0.0);
+        let row_height = 36.0;
+        let row_step = 40.0;
+        let top_y = (list_height - row_height).max(0.0);
+        let eject_x = (list_width - 50.0).max(0.0);
+        let mount_x = (eject_x - 52.0).max(0.0);
+        let title_width = (mount_x - 12.0).max(0.0);
+
         let devices = self.ivars().devices.borrow();
         if devices.is_empty() {
             let row = NSView::new(self.mtm());
             row.setFrame(NSRect::new(
-                NSPoint::new(0.0, 430.0),
-                NSSize::new(216.0, 30.0),
+                NSPoint::new(0.0, top_y),
+                NSSize::new(list_width, 30.0),
             ));
             row.setAutoresizingMask(
                 NSAutoresizingMaskOptions::ViewMinYMargin
@@ -1536,10 +1556,13 @@ impl Delegate {
             let label = NSTextField::labelWithString(ns_string!("未发现 MTP 设备"), self.mtm());
             label.setFrame(NSRect::new(
                 NSPoint::new(6.0, 5.0),
-                NSSize::new(204.0, 20.0),
+                NSSize::new((list_width - 12.0).max(0.0), 20.0),
             ));
             label.setFont(Some(&NSFont::systemFontOfSize(13.0)));
             label.setTextColor(Some(&NSColor::secondaryLabelColor()));
+            label.setUsesSingleLineMode(true);
+            label.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+            label.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
             row.addSubview(&label);
             device_list.addSubview(&row);
             self.ivars().device_row_views.borrow_mut().push(row);
@@ -1552,9 +1575,12 @@ impl Delegate {
         let controls_enabled = self.ivars().active_copies.load(Ordering::SeqCst) == 0;
 
         for (index, device) in devices.iter().enumerate() {
-            let y = 430.0 - (index as f64 * 40.0);
+            let y = (top_y - (index as f64 * row_step)).max(0.0);
             let row = NSView::new(self.mtm());
-            row.setFrame(NSRect::new(NSPoint::new(0.0, y), NSSize::new(216.0, 36.0)));
+            row.setFrame(NSRect::new(
+                NSPoint::new(0.0, y),
+                NSSize::new(list_width, row_height),
+            ));
             row.setAutoresizingMask(
                 NSAutoresizingMaskOptions::ViewMinYMargin
                     | NSAutoresizingMaskOptions::ViewWidthSizable,
@@ -1565,9 +1591,25 @@ impl Delegate {
             } else {
                 device.display()
             };
+            let title_label = NSTextField::labelWithString(&NSString::from_str(&title), self.mtm());
+            title_label.setFrame(NSRect::new(
+                NSPoint::new(6.0, 8.0),
+                NSSize::new(title_width, 20.0),
+            ));
+            title_label.setFont(Some(&NSFont::systemFontOfSize(13.0)));
+            title_label.setUsesSingleLineMode(true);
+            title_label.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+            title_label.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
+            let title_color = if current_location == Some(device.location_id) {
+                NSColor::labelColor()
+            } else {
+                NSColor::secondaryLabelColor()
+            };
+            title_label.setTextColor(Some(&title_color));
+
             let select_button = unsafe {
                 NSButton::buttonWithTitle_target_action(
-                    &NSString::from_str(&title),
+                    ns_string!(""),
                     Some(self),
                     Some(sel!(selectDevice:)),
                     self.mtm(),
@@ -1575,9 +1617,10 @@ impl Delegate {
             };
             select_button.setFrame(NSRect::new(
                 NSPoint::new(0.0, 3.0),
-                NSSize::new(118.0, 28.0),
+                NSSize::new((title_width + 12.0).max(0.0), 28.0),
             ));
             select_button.setBordered(false);
+            select_button.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
             select_button.setTag((index + 1) as NSInteger);
             select_button.setEnabled(controls_enabled);
 
@@ -1590,9 +1633,10 @@ impl Delegate {
                 )
             };
             mount_button.setFrame(NSRect::new(
-                NSPoint::new(122.0, 4.0),
-                NSSize::new(44.0, 26.0),
+                NSPoint::new(mount_x, 4.0),
+                NSSize::new(48.0, 26.0),
             ));
+            mount_button.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinXMargin);
             mount_button.setTag((index + 1) as NSInteger);
             mount_button.setEnabled(
                 controls_enabled
@@ -1609,13 +1653,15 @@ impl Delegate {
                 )
             };
             eject_button.setFrame(NSRect::new(
-                NSPoint::new(170.0, 4.0),
-                NSSize::new(44.0, 26.0),
+                NSPoint::new(eject_x, 4.0),
+                NSSize::new(48.0, 26.0),
             ));
+            eject_button.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinXMargin);
             eject_button.setTag((index + 1) as NSInteger);
             eject_button
                 .setEnabled(controls_enabled && mounted_location == Some(device.location_id));
 
+            row.addSubview(&title_label);
             row.addSubview(&select_button);
             row.addSubview(&mount_button);
             row.addSubview(&eject_button);
@@ -1704,6 +1750,8 @@ fn storage_nodes(storages: Vec<mtp_rs::Storage>) -> (Vec<BrowserNode>, Vec<usize
             name: info.description.clone(),
             kind: "存储".to_string(),
             size: format_bytes(info.free_space_bytes),
+            created: None,
+            modified: None,
             note: format!(
                 "Storage ID: {}\n可用空间: {}",
                 storage.id().0,
