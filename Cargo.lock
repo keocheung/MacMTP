@@ -227,6 +227,7 @@ dependencies = [
 name = "macmtp"
 version = "0.1.0"
 dependencies = [
+ "block2",
  "mtp-rs",
  "objc2",
  "objc2-app-kit",

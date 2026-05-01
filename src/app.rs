@@ -1,7 +1,7 @@
 use std::cell::{OnceCell, RefCell};
 use std::fs;
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use mtp_rs::mtp::{MtpDevice, MtpDeviceInfo};
 use mtp_rs::{ObjectHandle, StorageId};
@@ -9,17 +9,18 @@ use objc2_quartz as _;
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, ProtocolObject};
-use objc2::{DefinedClass, MainThreadOnly, define_class, msg_send};
+use objc2::{AnyThread, DefinedClass, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSBackingStoreType,
-    NSColor, NSControlTextEditingDelegate, NSDragOperation, NSDraggingSession, NSFont,
-    NSOutlineView, NSOutlineViewDataSource, NSOutlineViewDelegate, NSPasteboard,
-    NSPasteboardWriting, NSPopUpButton, NSTableColumn, NSTextField, NSView, NSWindow,
-    NSWindowDelegate, NSWindowStyleMask,
+    NSColor, NSControlTextEditingDelegate, NSDragOperation, NSDraggingSession,
+    NSFilePromiseProvider, NSFilePromiseProviderDelegate, NSFont, NSOutlineView,
+    NSOutlineViewDataSource, NSOutlineViewDelegate, NSPasteboard, NSPasteboardWriting,
+    NSPopUpButton, NSTableColumn, NSTextField, NSView, NSWindow, NSWindowDelegate,
+    NSWindowStyleMask,
 };
 use objc2_foundation::{
-    MainThreadMarker, NSArray, NSInteger, NSNotification, NSNumber, NSObject, NSObjectProtocol,
-    NSPoint, NSRect, NSSize, NSString, NSURL, ns_string,
+    MainThreadMarker, NSArray, NSError, NSInteger, NSNotification, NSNumber, NSObject,
+    NSObjectProtocol, NSOperationQueue, NSPoint, NSRect, NSSize, NSString, NSURL, ns_string,
 };
 use tokio::runtime::{Builder, Runtime};
 
@@ -29,6 +30,9 @@ use crate::util::{format_bytes, format_mtp_error, sanitize_filename};
 
 const DRAG_NODE_PREFIX: &str = "macmtp-node:";
 const DRAG_MTP_TIMEOUT: Duration = Duration::from_secs(8);
+const FILE_PROMISE_TYPE_FILE: &str = "public.data";
+const FILE_PROMISE_TYPE_FOLDER: &str = "public.folder";
+const FILE_PROMISE_ERROR_DOMAIN: &str = "MacMTPFilePromiseError";
 
 #[derive(Default)]
 pub(crate) struct AppDelegateIvars {
@@ -116,6 +120,56 @@ define_class!(
     unsafe impl NSOutlineViewDataSource for Delegate {}
     unsafe impl NSControlTextEditingDelegate for Delegate {}
     unsafe impl NSOutlineViewDelegate for Delegate {}
+
+    unsafe impl NSFilePromiseProviderDelegate for Delegate {
+        #[unsafe(method(filePromiseProvider:fileNameForType:))]
+        fn promise_file_name(
+            &self,
+            file_promise_provider: &NSFilePromiseProvider,
+            _file_type: &NSString,
+        ) -> *mut NSString {
+            let Some(index) = self.file_promise_index(file_promise_provider) else {
+                return Retained::autorelease_return(NSString::from_str("MacMTP Item"));
+            };
+            let name = self
+                .ivars()
+                .nodes
+                .borrow()
+                .get(index)
+                .map(|node| sanitize_filename(&node.name))
+                .unwrap_or_else(|| "MacMTP Item".to_string());
+            Retained::autorelease_return(NSString::from_str(&name))
+        }
+
+        #[unsafe(method(filePromiseProvider:writePromiseToURL:completionHandler:))]
+        fn write_promise_to_url(
+            &self,
+            file_promise_provider: &NSFilePromiseProvider,
+            url: &NSURL,
+            completion_handler: &block2::DynBlock<dyn Fn(*mut NSError)>,
+        ) {
+            let result = self.write_file_promise(file_promise_provider, url);
+            match result {
+                Ok(()) => {
+                    self.set_message("拖拽复制完成", "文件已复制到目标位置。");
+                    completion_handler.call((std::ptr::null_mut(),));
+                }
+                Err(message) => {
+                    self.set_message("拖拽复制失败", &message);
+                    let error = promise_error(&message);
+                    completion_handler.call((Retained::autorelease_return(error),));
+                }
+            }
+        }
+
+        #[unsafe(method(operationQueueForFilePromiseProvider:))]
+        fn promise_operation_queue(
+            &self,
+            _file_promise_provider: &NSFilePromiseProvider,
+        ) -> *mut NSOperationQueue {
+            Retained::autorelease_return(NSOperationQueue::mainQueue())
+        }
+    }
 
     impl Delegate {
         #[unsafe(method(outlineView:numberOfChildrenOfItem:))]
@@ -281,8 +335,10 @@ define_class!(
                 return std::ptr::null_mut();
             }
 
-            let marker = NSString::from_str(&format!("{DRAG_NODE_PREFIX}{index}"));
-            let object: Retained<AnyObject> = marker.into_super().into();
+            let Some(provider) = self.file_promise_provider(index) else {
+                return std::ptr::null_mut();
+            };
+            let object: Retained<AnyObject> = provider.into_super().into();
             Retained::autorelease_return(object)
         }
 
@@ -294,8 +350,12 @@ define_class!(
             _screen_point: NSPoint,
             dragged_items: &NSArray,
         ) {
-            let pasteboard = session.draggingPasteboard();
-            self.write_drag_items(dragged_items, &pasteboard);
+            let count = dragged_items.len();
+            self.set_message(
+                "可以拖拽复制",
+                &format!("已准备 {} 个文件承诺，松开鼠标后开始复制。", count),
+            );
+            let _ = session.draggingPasteboard();
         }
 
         #[allow(deprecated)]
@@ -306,7 +366,7 @@ define_class!(
             items: &NSArray,
             pasteboard: &NSPasteboard,
         ) -> bool {
-            self.write_drag_items(items, pasteboard)
+            self.write_drag_promises(items, pasteboard)
         }
 
         #[unsafe(method(outlineView:draggingSession:endedAtPoint:operation:))]
@@ -321,6 +381,7 @@ define_class!(
                 self.set_message("拖拽已取消", "没有复制文件。");
             }
         }
+
     }
 );
 
@@ -382,6 +443,40 @@ impl Delegate {
             .borrow()
             .get(index)
             .is_some_and(|node| node.is_file() || node.is_folder())
+    }
+
+    fn file_promise_provider(&self, index: usize) -> Option<Retained<NSFilePromiseProvider>> {
+        let file_type = {
+            let nodes = self.ivars().nodes.borrow();
+            let node = nodes.get(index)?;
+            if node.is_folder() {
+                FILE_PROMISE_TYPE_FOLDER
+            } else if node.is_file() {
+                FILE_PROMISE_TYPE_FILE
+            } else {
+                return None;
+            }
+        };
+
+        let provider = NSFilePromiseProvider::initWithFileType_delegate(
+            NSFilePromiseProvider::alloc(),
+            &NSString::from_str(file_type),
+            ProtocolObject::from_ref(self),
+        );
+        let marker: Retained<AnyObject> = NSString::from_str(&format!("{DRAG_NODE_PREFIX}{index}"))
+            .into_super()
+            .into();
+        unsafe { provider.setUserInfo(Some(&marker)) };
+        Some(provider)
+    }
+
+    fn file_promise_index(&self, provider: &NSFilePromiseProvider) -> Option<usize> {
+        let user_info = provider.userInfo()?;
+        let marker = user_info.downcast::<NSString>().ok()?;
+        marker
+            .to_string()
+            .strip_prefix(DRAG_NODE_PREFIX)
+            .and_then(|index| index.parse().ok())
     }
 
     fn update_detail(&self) {
@@ -699,44 +794,27 @@ impl Delegate {
         Some(path)
     }
 
-    fn write_drag_items(&self, items: &NSArray, pasteboard: &NSPasteboard) -> bool {
+    fn write_drag_promises(&self, items: &NSArray, pasteboard: &NSPasteboard) -> bool {
         let indexes = self.node_indexes_from_items(items);
         if indexes.is_empty() {
             return false;
         }
 
-        self.set_message("正在复制拖拽项目", "正在从 MTP 设备复制到本机临时目录。");
-        let export_root = std::env::temp_dir().join("macmtp-drag").join(format!(
-            "{}-{}",
-            std::process::id(),
-            timestamp_millis()
-        ));
-
-        let mut exported = Vec::new();
-        for index in indexes {
-            match self.export_node_for_drag(index, &export_root) {
-                Ok(path) => exported.push(path),
-                Err(message) => {
-                    self.set_message("拖拽复制失败", &message);
-                    return false;
-                }
-            }
+        let promises: Vec<Retained<ProtocolObject<dyn NSPasteboardWriting>>> = indexes
+            .into_iter()
+            .filter_map(|index| self.file_promise_provider(index))
+            .map(ProtocolObject::from_retained)
+            .collect();
+        if promises.is_empty() {
+            return false;
         }
 
-        let urls: Vec<Retained<ProtocolObject<dyn NSPasteboardWriting>>> = exported
-            .iter()
-            .map(|path| {
-                let ns_path = NSString::from_str(&path.to_string_lossy());
-                ProtocolObject::from_retained(NSURL::fileURLWithPath(&ns_path))
-            })
-            .collect();
-
         pasteboard.clearContents();
-        let objects = NSArray::from_retained_slice(&urls);
+        let objects = NSArray::from_retained_slice(&promises);
         if pasteboard.writeObjects(&objects) {
             self.set_message(
                 "可以拖拽复制",
-                &format!("已准备 {} 个项目，松开鼠标复制到目标位置。", exported.len()),
+                &format!("已准备 {} 个文件承诺，松开鼠标后开始复制。", promises.len()),
             );
             true
         } else {
@@ -745,7 +823,24 @@ impl Delegate {
         }
     }
 
-    fn export_node_for_drag(&self, index: usize, parent: &PathBuf) -> Result<PathBuf, String> {
+    fn write_file_promise(
+        &self,
+        provider: &NSFilePromiseProvider,
+        url: &NSURL,
+    ) -> Result<(), String> {
+        let index = self
+            .file_promise_index(provider)
+            .ok_or_else(|| "找不到拖拽项目。".to_string())?;
+        let path = url
+            .path()
+            .map(|path| PathBuf::from(path.to_string()))
+            .ok_or_else(|| "Finder 没有提供有效目标路径。".to_string())?;
+
+        self.set_message("正在复制拖拽项目", "正在从 MTP 设备复制到目标位置。");
+        self.export_node_to_path(index, &path)
+    }
+
+    fn export_node_to_path(&self, index: usize, path: &PathBuf) -> Result<(), String> {
         let node = self
             .ivars()
             .nodes
@@ -759,23 +854,23 @@ impl Delegate {
                 storage_id,
                 handle,
                 is_folder: false,
-            } => self.export_file(storage_id, handle, &node.name, parent),
+            } => self.export_file_to_path(storage_id, handle, path),
             NodeSource::Object {
                 is_folder: true, ..
-            } => self.export_folder(index, &node.name, parent),
+            } => self.export_folder_to_path(index, path),
             _ => Err("只能拖拽 MTP 文件或文件夹。".to_string()),
         }
     }
 
-    fn export_file(
+    fn export_file_to_path(
         &self,
         storage_id: StorageId,
         handle: ObjectHandle,
-        name: &str,
-        parent: &PathBuf,
-    ) -> Result<PathBuf, String> {
-        fs::create_dir_all(parent).map_err(|err| format!("无法创建目标目录: {err}"))?;
-        let path = unique_child_path(parent, &sanitize_filename(name));
+        path: &PathBuf,
+    ) -> Result<(), String> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|err| format!("无法创建目标目录: {err}"))?;
+        }
         let device = self
             .ivars()
             .device
@@ -796,14 +891,12 @@ impl Delegate {
             })
             .map_err(|message| message)?;
 
-        fs::write(&path, data).map_err(|err| format!("无法写入文件: {err}"))?;
-        Ok(path)
+        fs::write(path, data).map_err(|err| format!("无法写入文件: {err}"))
     }
 
-    fn export_folder(&self, index: usize, name: &str, parent: &PathBuf) -> Result<PathBuf, String> {
+    fn export_folder_to_path(&self, index: usize, path: &PathBuf) -> Result<(), String> {
         self.load_children_result(index, Some(DRAG_MTP_TIMEOUT))?;
-        let folder = unique_child_path(parent, &sanitize_filename(name));
-        fs::create_dir_all(&folder).map_err(|err| format!("无法创建文件夹: {err}"))?;
+        fs::create_dir_all(path).map_err(|err| format!("无法创建文件夹: {err}"))?;
 
         let children = self
             .ivars()
@@ -813,17 +906,19 @@ impl Delegate {
             .map(|node| node.children.clone())
             .unwrap_or_default();
         for child in children {
-            let is_copyable = self
+            let child_name = self
                 .ivars()
                 .nodes
                 .borrow()
                 .get(child)
-                .is_some_and(|node| node.is_file() || node.is_folder());
-            if is_copyable {
-                self.export_node_for_drag(child, &folder)?;
-            }
+                .map(|node| sanitize_filename(&node.name));
+            let Some(child_name) = child_name else {
+                continue;
+            };
+            let child_path = unique_child_path(path, &child_name);
+            self.export_node_to_path(child, &child_path)?;
         }
-        Ok(folder)
+        Ok(())
     }
 
     fn runtime(&self) -> &Runtime {
@@ -871,11 +966,15 @@ fn unique_child_path(parent: &PathBuf, name: &str) -> PathBuf {
     unreachable!()
 }
 
-fn timestamp_millis() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
-        .unwrap_or_default()
+fn promise_error(message: &str) -> Retained<NSError> {
+    let _ = message;
+    unsafe {
+        NSError::errorWithDomain_code_userInfo(
+            &NSString::from_str(FILE_PROMISE_ERROR_DOMAIN),
+            1,
+            None,
+        )
+    }
 }
 
 pub fn run() {
