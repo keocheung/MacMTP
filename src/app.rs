@@ -21,7 +21,7 @@ use objc2_app_kit::{
     NSEvent, NSFilePromiseProvider, NSFilePromiseProviderDelegate, NSFont, NSLineBreakMode, NSMenu,
     NSMenuDelegate, NSOutlineView, NSOutlineViewDataSource, NSOutlineViewDelegate, NSPasteboard,
     NSPasteboardWriting, NSPopUpButton, NSProgressIndicator, NSTableColumn, NSTextField, NSView,
-    NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSWindow, NSWindowDelegate, NSWindowStyleMask, NSWorkspace,
 };
 use objc2_foundation::{
     MainThreadMarker, NSArray, NSError, NSIndexSet, NSInteger, NSNotification, NSNumber, NSObject,
@@ -31,6 +31,7 @@ use objc2_foundation::{
 use tokio::runtime::{Builder, Runtime};
 
 use crate::model::{BrowserNode, NodeSource, message_node};
+use crate::mount::{self, MountHandle};
 use crate::ui::{build_browser_ui, install_main_menu};
 use crate::util::{format_bytes, format_mtp_error, sanitize_filename};
 
@@ -52,12 +53,17 @@ pub(crate) struct AppDelegateIvars {
     devices: RefCell<Vec<MtpDeviceInfo>>,
     device: RefCell<Option<MtpDevice>>,
     current_device_location: RefCell<Option<u64>>,
+    current_mount: RefCell<Option<MountHandle>>,
     nodes: RefCell<Vec<BrowserNode>>,
     root_children: RefCell<Vec<usize>>,
     mtp_lock: Arc<Mutex<()>>,
     active_copies: Arc<AtomicUsize>,
     copy_events_tx: OnceCell<mpsc::Sender<CopyEvent>>,
     copy_events_rx: RefCell<Option<mpsc::Receiver<CopyEvent>>>,
+    mount_events_tx: OnceCell<mpsc::Sender<MountEvent>>,
+    mount_events_rx: RefCell<Option<mpsc::Receiver<MountEvent>>>,
+    device_events_tx: OnceCell<mpsc::Sender<DeviceEvent>>,
+    device_events_rx: RefCell<Option<mpsc::Receiver<DeviceEvent>>>,
     copy_error: RefCell<Option<String>>,
     copy_timer: OnceCell<Retained<NSTimer>>,
 }
@@ -80,6 +86,20 @@ enum CopyEvent {
     },
     Finished {
         result: Result<(), String>,
+    },
+}
+
+enum MountEvent {
+    Finished {
+        location_id: u64,
+        result: Result<MountHandle, String>,
+    },
+}
+
+enum DeviceEvent {
+    Connected {
+        device_info: MtpDeviceInfo,
+        result: Result<(MtpDevice, Vec<BrowserNode>, Vec<usize>), String>,
     },
 }
 
@@ -158,6 +178,11 @@ define_class!(
             app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
             #[allow(deprecated)]
             app.activateIgnoringOtherApps(true);
+        }
+
+        #[unsafe(method(applicationWillTerminate:))]
+        fn will_terminate(&self, _notification: &NSNotification) {
+            self.close_current_device();
         }
     }
 
@@ -505,7 +530,15 @@ impl Delegate {
         self.update_detail();
     }
 
+    fn set_browser_message(&self, title: &str, detail: &str) {
+        *self.ivars().nodes.borrow_mut() = vec![message_node(title, detail)];
+        *self.ivars().root_children.borrow_mut() = vec![0];
+        self.reload_outline();
+        self.set_message(title, detail);
+    }
+
     fn close_current_device(&self) {
+        self.eject_current_mount();
         let device = self.ivars().device.borrow_mut().take();
         self.ivars().current_device_location.borrow_mut().take();
         if let Some(device) = device {
@@ -518,6 +551,16 @@ impl Delegate {
                 })
             });
         }
+    }
+
+    fn eject_current_mount(&self) {
+        let Some(mount) = self.ivars().current_mount.borrow_mut().take() else {
+            return;
+        };
+        let path = mount.mountpoint().to_string_lossy().to_string();
+        let workspace = NSWorkspace::sharedWorkspace();
+        let _ = workspace.unmountAndEjectDeviceAtPath(&NSString::from_str(&path));
+        drop(mount);
     }
 
     fn is_device_popup_menu(&self, menu: &NSMenu) -> bool {
@@ -786,99 +829,82 @@ impl Delegate {
             None => return,
         };
 
-        if self.ivars().device.borrow().is_some()
-            && *self.ivars().current_device_location.borrow() == Some(device_info.location_id)
-        {
-            self.load_storages();
-            return;
-        }
-
         self.close_current_device();
-        self.clear_browser_state();
-        self.set_message("正在连接设备", &device_info.display());
-        let result = self.with_mtp_lock(|| {
-            self.runtime()
-                .block_on(MtpDevice::open_by_location(device_info.location_id))
-        });
-
-        match result {
-            Ok(Ok(device)) => {
-                self.ivars().device.replace(Some(device));
-                self.ivars()
-                    .current_device_location
-                    .replace(Some(device_info.location_id));
-                self.load_storages();
-            }
-            Ok(Err(err)) => {
-                self.ivars().device.borrow_mut().take();
-                self.ivars().current_device_location.borrow_mut().take();
-                self.set_message("连接设备失败", &format_mtp_error(&err));
-                self.clear_browser_state();
-            }
-            Err(message) => {
-                self.ivars().device.borrow_mut().take();
-                self.ivars().current_device_location.borrow_mut().take();
-                self.set_message("连接设备失败", &message);
-                self.clear_browser_state();
-            }
-        }
+        self.ivars()
+            .current_device_location
+            .replace(Some(device_info.location_id));
+        self.set_browser_message("正在连接设备", &device_info.display());
+        self.start_device_connect(device_info);
     }
 
-    fn load_storages(&self) {
-        let Some(device) = self.ivars().device.borrow().clone() else {
+    fn start_device_connect(&self, device_info: MtpDeviceInfo) {
+        let Some(tx) = self.ivars().device_events_tx.get().cloned() else {
+            self.set_browser_message("连接设备失败", "设备事件通道未初始化。");
             return;
         };
-        let result =
-            self.with_mtp_lock(|| self.runtime().block_on(async { device.storages().await }));
-        let storages = match result {
-            Ok(Ok(storages)) => storages,
-            Ok(Err(err)) => {
-                self.set_message("读取存储失败", &format_mtp_error(&err));
-                return;
-            }
-            Err(message) => {
-                self.set_message("读取存储失败", &message);
-                return;
-            }
-        };
-
-        let mut nodes = Vec::new();
-        let mut roots = Vec::new();
-        for storage in storages {
-            let info = storage.info();
-            let index = nodes.len();
-            roots.push(index);
-            nodes.push(BrowserNode {
-                name: info.description.clone(),
-                kind: "存储".to_string(),
-                size: format_bytes(info.free_space_bytes),
-                note: format!(
-                    "Storage ID: {}\n可用空间: {}",
-                    storage.id().0,
-                    format_bytes(info.free_space_bytes)
-                ),
-                source: NodeSource::Storage {
-                    storage_id: storage.id(),
-                },
-                children: Vec::new(),
-                children_loaded: false,
-                can_expand: true,
-                cached_path: None,
+        let mtp_lock = self.ivars().mtp_lock.clone();
+        thread::spawn(move || {
+            let result = run_device_connect_worker(device_info.clone(), mtp_lock);
+            let _ = tx.send(DeviceEvent::Connected {
+                device_info,
+                result,
             });
+        });
+    }
+
+    fn apply_connected_device(
+        &self,
+        device_info: MtpDeviceInfo,
+        device: MtpDevice,
+        nodes: Vec<BrowserNode>,
+        roots: Vec<usize>,
+    ) {
+        if *self.ivars().current_device_location.borrow() != Some(device_info.location_id) {
+            let _ = self.with_mtp_lock(|| {
+                self.runtime().block_on(async {
+                    device
+                        .session()
+                        .execute(OperationCode::CloseSession, &[])
+                        .await
+                })
+            });
+            return;
         }
 
-        if roots.is_empty() {
-            nodes.push(message_node(
-                "设备没有可用存储",
-                "MTP 设备未返回 storage 列表。",
-            ));
-            roots.push(0);
-        }
-
+        let device_for_mount = device.clone();
+        self.ivars().device.replace(Some(device));
         *self.ivars().nodes.borrow_mut() = nodes;
         *self.ivars().root_children.borrow_mut() = roots;
         self.reload_outline();
         self.update_detail();
+        self.mount_current_device(device_for_mount, &device_info);
+    }
+
+    fn mount_current_device(&self, device: MtpDevice, device_info: &MtpDeviceInfo) {
+        self.eject_current_mount();
+        if !mount::macfuse_available() {
+            self.set_message(
+                "已连接设备",
+                "未检测到 macFUSE，保留内置浏览器模式。安装 macFUSE 后可自动挂载到 Finder。",
+            );
+            return;
+        }
+
+        let Some(tx) = self.ivars().mount_events_tx.get().cloned() else {
+            self.set_message("Finder 挂载失败", "挂载事件通道未初始化，仍可使用内置浏览器。");
+            return;
+        };
+        let device_info = device_info.clone();
+        let location_id = device_info.location_id;
+        let mtp_lock = self.ivars().mtp_lock.clone();
+        self.set_message("正在挂载到 Finder", "内置浏览器已可使用，Finder 挂载将在后台完成。");
+        thread::spawn(move || {
+            let result = mount::mount_device(device, &device_info, mtp_lock);
+            let _ = tx.send(MountEvent::Finished {
+                location_id,
+                result,
+            });
+        });
     }
 
     fn load_children(&self, index: usize) {
@@ -1168,9 +1194,15 @@ impl Delegate {
     }
 
     fn install_copy_event_timer(&self) {
-        let (tx, rx) = mpsc::channel();
-        self.ivars().copy_events_tx.set(tx).ok();
-        *self.ivars().copy_events_rx.borrow_mut() = Some(rx);
+        let (copy_tx, copy_rx) = mpsc::channel();
+        self.ivars().copy_events_tx.set(copy_tx).ok();
+        *self.ivars().copy_events_rx.borrow_mut() = Some(copy_rx);
+        let (mount_tx, mount_rx) = mpsc::channel();
+        self.ivars().mount_events_tx.set(mount_tx).ok();
+        *self.ivars().mount_events_rx.borrow_mut() = Some(mount_rx);
+        let (device_tx, device_rx) = mpsc::channel();
+        self.ivars().device_events_tx.set(device_tx).ok();
+        *self.ivars().device_events_rx.borrow_mut() = Some(device_rx);
         let timer = unsafe {
             NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
                 0.1,
@@ -1184,6 +1216,8 @@ impl Delegate {
     }
 
     fn drain_copy_events(&self) {
+        self.drain_device_events();
+        self.drain_mount_events();
         let mut last_progress = None;
         let mut last_result = None;
         if let Some(rx) = self.ivars().copy_events_rx.borrow_mut().as_mut() {
@@ -1223,6 +1257,77 @@ impl Delegate {
                 } else if result.is_ok() {
                     self.set_message("拖拽复制完成", "文件已复制到目标位置。");
                 }
+            }
+        }
+    }
+
+    fn drain_device_events(&self) {
+        let mut last_result = None;
+        if let Some(rx) = self.ivars().device_events_rx.borrow_mut().as_mut() {
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    DeviceEvent::Connected {
+                        device_info,
+                        result,
+                    } => {
+                        last_result = Some((device_info, result));
+                    }
+                }
+            }
+        }
+
+        let Some((device_info, result)) = last_result else {
+            return;
+        };
+        if *self.ivars().current_device_location.borrow() != Some(device_info.location_id) {
+            return;
+        }
+
+        match result {
+            Ok((device, nodes, roots)) => {
+                self.apply_connected_device(device_info, device, nodes, roots);
+            }
+            Err(message) => {
+                self.ivars().device.borrow_mut().take();
+                self.ivars().current_device_location.borrow_mut().take();
+                self.set_browser_message("连接设备失败", &message);
+            }
+        }
+    }
+
+    fn drain_mount_events(&self) {
+        let mut last_result = None;
+        if let Some(rx) = self.ivars().mount_events_rx.borrow_mut().as_mut() {
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    MountEvent::Finished {
+                        location_id,
+                        result,
+                    } => {
+                        last_result = Some((location_id, result));
+                    }
+                }
+            }
+        }
+
+        let Some((location_id, result)) = last_result else {
+            return;
+        };
+        if *self.ivars().current_device_location.borrow() != Some(location_id) {
+            if let Ok(handle) = result {
+                drop(handle);
+            }
+            return;
+        }
+
+        match result {
+            Ok(handle) => {
+                let path = handle.mountpoint().display().to_string();
+                self.ivars().current_mount.replace(Some(handle));
+                self.set_message("已挂载到 Finder", &format!("设备已挂载到 {path}。退出前会自动推出。"));
+            }
+            Err(message) => {
+                self.set_message("Finder 挂载失败", &format!("{message}\n仍可使用内置浏览器。"));
             }
         }
     }
@@ -1327,6 +1432,63 @@ fn run_copy_worker(
         tx,
     };
     runtime.block_on(async { export_node_worker(&device, &node, &path, &mut state).await })
+}
+
+fn run_device_connect_worker(
+    device_info: MtpDeviceInfo,
+    mtp_lock: Arc<Mutex<()>>,
+) -> Result<(MtpDevice, Vec<BrowserNode>, Vec<usize>), String> {
+    let _guard = mtp_lock
+        .lock()
+        .map_err(|_| "MTP 操作锁已损坏。".to_string())?;
+    let runtime = Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| format!("无法创建设备连接运行时: {err}"))?;
+    let device = runtime
+        .block_on(MtpDevice::open_by_location(device_info.location_id))
+        .map_err(|err| format_mtp_error(&err))?;
+    let storages = runtime
+        .block_on(async { device.storages().await })
+        .map_err(|err| format_mtp_error(&err))?;
+    let (nodes, roots) = storage_nodes(storages);
+    Ok((device, nodes, roots))
+}
+
+fn storage_nodes(storages: Vec<mtp_rs::Storage>) -> (Vec<BrowserNode>, Vec<usize>) {
+    let mut nodes = Vec::new();
+    let mut roots = Vec::new();
+    for storage in storages {
+        let info = storage.info();
+        let index = nodes.len();
+        roots.push(index);
+        nodes.push(BrowserNode {
+            name: info.description.clone(),
+            kind: "存储".to_string(),
+            size: format_bytes(info.free_space_bytes),
+            note: format!(
+                "Storage ID: {}\n可用空间: {}",
+                storage.id().0,
+                format_bytes(info.free_space_bytes)
+            ),
+            source: NodeSource::Storage {
+                storage_id: storage.id(),
+            },
+            children: Vec::new(),
+            children_loaded: false,
+            can_expand: true,
+            cached_path: None,
+        });
+    }
+
+    if roots.is_empty() {
+        nodes.push(message_node(
+            "设备没有可用存储",
+            "MTP 设备未返回 storage 列表。",
+        ));
+        roots.push(0);
+    }
+    (nodes, roots)
 }
 
 struct CopyState {

@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 block2 = "0.6.2"
+fuser = { version = "0.17.0", features = ["macfuse-4-compat"] }
 objc2 = "0.6.4"
 objc2-app-kit = "0.3.2"
 objc2-foundation = "0.3.2"
