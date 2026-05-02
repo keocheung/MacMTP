@@ -1,6 +1,6 @@
 [package]
 name = "macmtp"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [dependencies]
@@ -15,6 +15,7 @@ tokio = { version = "1", features = ["rt", "time"] }
 unicode-normalization = "0.1.25"
 
 [package.metadata.packager]
+productName = "MacMTP"
 identifier = "moe.keo.macmtp"
 icons = ["assets/icons/*.png"]
 before-packaging-command = "cargo build --release"
