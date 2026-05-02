@@ -18,6 +18,7 @@ use mtp_rs::mtp::{MtpDevice, MtpDeviceInfo};
 use mtp_rs::ptp::{DateTime, ObjectInfo};
 use mtp_rs::{ObjectHandle, StorageId};
 use tokio::runtime::Builder;
+use unicode_normalization::UnicodeNormalization;
 
 use crate::util::{format_mtp_error, mtp_datetime_to_system_time, sanitize_filename};
 
@@ -466,7 +467,7 @@ impl Filesystem for MtpFuseFs {
             children
                 .into_iter()
                 .filter_map(|ino| state.entries.get(&ino))
-                .find(|entry| entry.name == name)
+                .find(|entry| filename_matches(&entry.name, name))
                 .map(|entry| Self::attr_for(entry, req.uid(), req.gid()))
                 .ok_or(Errno::ENOENT)
         });
@@ -581,11 +582,57 @@ fn unique_name(names: &mut HashMap<String, usize>, name: String) -> String {
     } else {
         name
     };
-    let count = names.entry(base.clone()).or_insert(0);
+    let count = names.entry(normalized_name_key(&base)).or_insert(0);
     *count += 1;
     if *count == 1 {
         base
     } else {
         format!("{base} {}", *count)
+    }
+}
+
+fn filename_matches(entry_name: &OsStr, lookup_name: &OsStr) -> bool {
+    if entry_name == lookup_name {
+        return true;
+    }
+
+    let Some(entry_name) = entry_name.to_str() else {
+        return false;
+    };
+    let Some(lookup_name) = lookup_name.to_str() else {
+        return false;
+    };
+
+    normalized_name_key(entry_name) == normalized_name_key(lookup_name)
+}
+
+fn normalized_name_key(name: &str) -> String {
+    name.nfc().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filename_lookup_matches_canonically_equivalent_names() {
+        let composed = OsStr::new("Pok\u{e9}mon");
+        let decomposed = OsStr::new("Poke\u{301}mon");
+
+        assert!(filename_matches(composed, decomposed));
+    }
+
+    #[test]
+    fn unique_name_treats_canonically_equivalent_names_as_duplicates() {
+        let mut names = HashMap::new();
+
+        assert_eq!(
+            unique_name(&mut names, "Pok\u{e9}mon".to_string()),
+            "Pok\u{e9}mon"
+        );
+        assert_eq!(
+            unique_name(&mut names, "Poke\u{301}mon".to_string()),
+            "Poke\u{301}mon 2"
+        );
     }
 }
