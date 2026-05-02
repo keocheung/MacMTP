@@ -12,6 +12,7 @@ use objc2_app_kit::{
 use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize, NSString, ns_string};
 
 use crate::app::Delegate;
+use crate::loc::{ns_tr, tr};
 use crate::outline::PreviewOutlineView;
 
 pub fn build_browser_ui(delegate: &Delegate, mtm: MainThreadMarker, content: &NSView) {
@@ -38,7 +39,7 @@ pub fn build_browser_ui(delegate: &Delegate, mtm: MainThreadMarker, content: &NS
 
     let refresh_button = unsafe {
         NSButton::buttonWithTitle_target_action(
-            ns_string!("刷新"),
+            &ns_tr("Refresh"),
             Some(delegate),
             Some(sel!(refreshDevices:)),
             mtm,
@@ -51,9 +52,9 @@ pub fn build_browser_ui(delegate: &Delegate, mtm: MainThreadMarker, content: &NS
     refresh_button.setAutoresizingMask(
         NSAutoresizingMaskOptions::ViewMinYMargin | NSAutoresizingMaskOptions::ViewWidthSizable,
     );
-    apply_button_symbol(&refresh_button, "arrow.clockwise", "刷新");
+    apply_button_symbol(&refresh_button, "arrow.clockwise", &tr("Refresh"));
 
-    let sidebar_title = NSTextField::labelWithString(ns_string!("设备"), mtm);
+    let sidebar_title = NSTextField::labelWithString(&ns_tr("Devices"), mtm);
     sidebar_title.setFrame(NSRect::new(
         NSPoint::new(12.0, 486.0),
         NSSize::new(216.0, 20.0),
@@ -89,11 +90,11 @@ pub fn build_browser_ui(delegate: &Delegate, mtm: MainThreadMarker, content: &NS
         outline.setDoubleAction(Some(sel!(showQuickLook:)));
     }
 
-    let name_column = make_column(mtm, "name", "名称", 300.0);
-    let kind_column = make_column(mtm, "kind", "类型", 80.0);
-    let size_column = make_column(mtm, "size", "大小", 90.0);
-    let created_column = make_column(mtm, "created", "添加时间", 150.0);
-    let modified_column = make_column(mtm, "modified", "修改时间", 150.0);
+    let name_column = make_column(mtm, "name", "Name", 300.0);
+    let kind_column = make_column(mtm, "kind", "Kind", 80.0);
+    let size_column = make_column(mtm, "size", "Size", 90.0);
+    let created_column = make_column(mtm, "created", "Created", 150.0);
+    let modified_column = make_column(mtm, "modified", "Modified", 150.0);
     outline.addTableColumn(&name_column);
     outline.addTableColumn(&kind_column);
     outline.addTableColumn(&size_column);
@@ -133,7 +134,7 @@ pub fn build_browser_ui(delegate: &Delegate, mtm: MainThreadMarker, content: &NS
         NSAutoresizingMaskOptions::ViewHeightSizable | NSAutoresizingMaskOptions::ViewWidthSizable,
     );
 
-    let title = NSTextField::labelWithString(ns_string!("未选择文件"), mtm);
+    let title = NSTextField::labelWithString(&ns_tr("No File Selected"), mtm);
     title.setFrame(NSRect::new(
         NSPoint::new(16.0, 430.0),
         NSSize::new(208.0, 78.0),
@@ -171,7 +172,7 @@ pub fn build_browser_ui(delegate: &Delegate, mtm: MainThreadMarker, content: &NS
 
     let mount_button = unsafe {
         NSButton::buttonWithTitle_target_action(
-            ns_string!("挂载"),
+            &ns_tr("Mount"),
             Some(delegate),
             Some(sel!(mountDevice:)),
             mtm,
@@ -185,11 +186,11 @@ pub fn build_browser_ui(delegate: &Delegate, mtm: MainThreadMarker, content: &NS
         NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMaxYMargin,
     );
     mount_button.setTag(0);
-    apply_button_symbol(&mount_button, "mount", "挂载");
+    apply_button_symbol(&mount_button, "mount", &tr("Mount"));
 
     let eject_button = unsafe {
         NSButton::buttonWithTitle_target_action(
-            ns_string!("推出"),
+            &ns_tr("Eject"),
             Some(delegate),
             Some(sel!(ejectDevice:)),
             mtm,
@@ -203,7 +204,7 @@ pub fn build_browser_ui(delegate: &Delegate, mtm: MainThreadMarker, content: &NS
         NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMaxYMargin,
     );
     eject_button.setTag(0);
-    apply_button_symbol(&eject_button, "eject", "推出");
+    apply_button_symbol(&eject_button, "eject", &tr("Eject"));
 
     let progress = NSProgressIndicator::new(mtm);
     progress.setFrame(NSRect::new(
@@ -266,7 +267,7 @@ fn make_column(
         NSTableColumn::alloc(mtm),
         &NSString::from_str(identifier),
     );
-    column.setTitle(&NSString::from_str(title));
+    column.setTitle(&ns_tr(title));
     column.setWidth(width);
     column.setMinWidth(width);
     column.setResizingMask(NSTableColumnResizingOptions::UserResizingMask);
@@ -300,7 +301,7 @@ pub fn install_main_menu(app: &NSApplication, delegate: &Delegate, mtm: MainThre
     let quit_item = unsafe {
         NSMenuItem::initWithTitle_action_keyEquivalent(
             NSMenuItem::alloc(mtm),
-            ns_string!("退出 MacMTP"),
+            &ns_tr("Quit MacMTP"),
             Some(sel!(terminate:)),
             ns_string!("q"),
         )
@@ -311,18 +312,18 @@ pub fn install_main_menu(app: &NSApplication, delegate: &Delegate, mtm: MainThre
     let file_item = unsafe {
         NSMenuItem::initWithTitle_action_keyEquivalent(
             NSMenuItem::alloc(mtm),
-            ns_string!("File"),
+            &ns_tr("File"),
             None,
             ns_string!(""),
         )
     };
     main_menu.addItem(&file_item);
 
-    let file_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("File"));
+    let file_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), &ns_tr("File"));
     let quicklook_item = unsafe {
         NSMenuItem::initWithTitle_action_keyEquivalent(
             NSMenuItem::alloc(mtm),
-            ns_string!("Quick Look"),
+            &ns_tr("Quick Look"),
             Some(sel!(showQuickLook:)),
             ns_string!(" "),
         )
@@ -335,18 +336,18 @@ pub fn install_main_menu(app: &NSApplication, delegate: &Delegate, mtm: MainThre
     let device_item = unsafe {
         NSMenuItem::initWithTitle_action_keyEquivalent(
             NSMenuItem::alloc(mtm),
-            ns_string!("Device"),
+            &ns_tr("Device"),
             None,
             ns_string!(""),
         )
     };
     main_menu.addItem(&device_item);
 
-    let device_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("Device"));
+    let device_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), &ns_tr("Device"));
     let refresh_item = unsafe {
         NSMenuItem::initWithTitle_action_keyEquivalent(
             NSMenuItem::alloc(mtm),
-            ns_string!("Refresh Devices"),
+            &ns_tr("Refresh Devices"),
             Some(sel!(refreshDevices:)),
             ns_string!("r"),
         )

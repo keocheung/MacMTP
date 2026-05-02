@@ -2,6 +2,8 @@ use std::time::{Duration, SystemTime};
 
 use mtp_rs::ptp::DateTime;
 
+use crate::loc::tr;
+
 pub fn format_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut value = bytes as f64;
@@ -78,7 +80,11 @@ pub fn format_mtp_error(err: &mtp_rs::Error) -> String {
     let message = err.to_string();
     if err.is_exclusive_access() {
         format!(
-            "{message}\n\nmacOS 的 ptpcamerad 或 Android File Transfer 可能占用了设备。请退出相关程序，必要时临时运行: pkill -9 ptpcamerad"
+            "{}\n\n{}",
+            message,
+            tr(
+                "macOS ptpcamerad or Android File Transfer may be using this device. Quit related apps; if needed, run temporarily: pkill -9 ptpcamerad"
+            )
         )
     } else {
         message

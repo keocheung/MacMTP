@@ -1,6 +1,6 @@
 [package]
 name = "macmtp"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 
 [dependencies]
@@ -19,3 +19,11 @@ productName = "MacMTP"
 identifier = "moe.keo.macmtp"
 icons = ["assets/icons/*.png"]
 before-packaging-command = "cargo build --release"
+binaries-dir = "target/release"
+resources = [
+    { src = "assets/locales/en.lproj", target = "en.lproj" },
+    { src = "assets/locales/zh-Hans.lproj", target = "zh-Hans.lproj" },
+]
+
+[package.metadata.packager.macos]
+info-plist-path = "assets/Info.plist"

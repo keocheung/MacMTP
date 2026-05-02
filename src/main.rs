@@ -1,5 +1,6 @@
 mod app;
 mod device_row;
+mod loc;
 mod model;
 mod mount;
 mod outline;

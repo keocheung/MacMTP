@@ -33,6 +33,7 @@ use objc2_foundation::{
 use tokio::runtime::{Builder, Runtime};
 
 use crate::device_row::DeviceRowView;
+use crate::loc::{ns_tr, tr};
 use crate::model::{BrowserNode, NodeSource, message_node};
 use crate::mount::{self, MountHandle};
 use crate::ui::{build_browser_ui, install_main_menu};
@@ -290,7 +291,7 @@ define_class!(
             if let Err(message) =
                 self.start_file_promise_copy(file_promise_provider, url, completion_handler.copy())
             {
-                self.set_message("拖拽复制失败", &message);
+                self.set_message(&tr("Drag Copy Failed"), &message);
                 let error = promise_error(&message);
                 completion_handler.call((Retained::autorelease_return(error),));
             }
@@ -350,7 +351,7 @@ define_class!(
 
         #[unsafe(method(outlineView:shouldExpandItem:))]
         fn outline_should_expand_item(&self, outline_view: &NSOutlineView, item: &AnyObject) -> bool {
-            if self.reject_mtp_while_copying("正在复制文件，暂时不能读取目录。") {
+            if self.reject_mtp_while_copying(&tr("Files are copying. Directories cannot be read right now.")) {
                 return false.into();
             }
             if let Some(index) = self.item_index(Some(item)) {
@@ -422,7 +423,7 @@ define_class!(
 
         #[unsafe(method(showQuickLook:))]
         fn show_quick_look(&self, _sender: Option<&AnyObject>) {
-            if self.reject_mtp_while_copying("正在复制文件，暂时不能预览。") {
+            if self.reject_mtp_while_copying(&tr("Files are copying. Preview is unavailable right now.")) {
                 return;
             }
             self.open_quick_look_panel();
@@ -430,7 +431,7 @@ define_class!(
 
         #[unsafe(method(refreshDevices:))]
         fn refresh_devices_action(&self, _sender: Option<&AnyObject>) {
-            if self.reject_mtp_while_copying("正在复制文件，暂时不能刷新设备。") {
+            if self.reject_mtp_while_copying(&tr("Files are copying. Devices cannot be refreshed right now.")) {
                 return;
             }
             self.refresh_devices();
@@ -438,7 +439,7 @@ define_class!(
 
         #[unsafe(method(selectDevice:))]
         fn select_device_action(&self, sender: Option<&AnyObject>) {
-            if self.reject_mtp_while_copying("正在复制文件，暂时不能切换设备。") {
+            if self.reject_mtp_while_copying(&tr("Files are copying. Devices cannot be switched right now.")) {
                 return;
             }
             let Some(index) = self.sender_device_index(sender) else {
@@ -449,7 +450,7 @@ define_class!(
 
         #[unsafe(method(mountDevice:))]
         fn mount_device_action(&self, sender: Option<&AnyObject>) {
-            if self.reject_mtp_while_copying("正在复制文件，暂时不能挂载设备。") {
+            if self.reject_mtp_while_copying(&tr("Files are copying. Devices cannot be mounted right now.")) {
                 return;
             }
             let Some(index) = self.sender_device_index(sender) else {
@@ -460,7 +461,7 @@ define_class!(
 
         #[unsafe(method(ejectDevice:))]
         fn eject_device_action(&self, sender: Option<&AnyObject>) {
-            if self.reject_mtp_while_copying("正在复制文件，暂时不能推出设备。") {
+            if self.reject_mtp_while_copying(&tr("Files are copying. Devices cannot be ejected right now.")) {
                 return;
             }
             let Some(index) = self.sender_device_index(sender) else {
@@ -555,8 +556,9 @@ define_class!(
         ) {
             let count = dragged_items.len();
             self.set_message(
-                "可以拖拽复制",
-                &format!("已准备 {} 个文件承诺，松开鼠标后开始复制。", count),
+                &tr("Ready to Drag Copy"),
+                &tr("Prepared {count} file promises. Release the mouse to start copying.")
+                    .replace("{count}", &count.to_string()),
             );
             let _ = session.draggingPasteboard();
         }
@@ -581,7 +583,7 @@ define_class!(
             operation: NSDragOperation,
         ) {
             if operation == NSDragOperation::None {
-                self.set_message("拖拽已取消", "没有复制文件。");
+                self.set_message(&tr("Drag Cancelled"), &tr("No files were copied."));
             }
         }
 
@@ -597,8 +599,8 @@ impl Delegate {
     fn show_initial_device_prompt(&self) {
         self.render_device_rows();
         self.set_message(
-            "请选择设备",
-            "左侧设备栏会在启动时扫描 MTP 设备，也可以点击刷新。",
+            &tr("Select a Device"),
+            &tr("The left device list scans MTP devices on launch. You can also click Refresh."),
         );
     }
 
@@ -799,28 +801,34 @@ impl Delegate {
                 node.name.to_string(),
                 node.note.clone(),
                 vec![
-                    ("类型".to_string(), node.kind),
-                    ("大小".to_string(), node.size),
-                    ("创建时间".to_string(), format_mtp_datetime(node.created)),
-                    ("修改时间".to_string(), format_mtp_datetime(node.modified)),
+                    (tr("Kind"), node.kind),
+                    (tr("Size"), node.size),
+                    (tr("Created"), format_mtp_datetime(node.created)),
+                    (tr("Modified"), format_mtp_datetime(node.modified)),
                 ],
             ),
             Some(node) if node.is_folder() => (
                 node.name.to_string(),
                 node.note.clone(),
                 vec![
-                    ("类型".to_string(), node.kind),
-                    ("项目".to_string(), format!("{} 个", node.children.len())),
-                    ("创建时间".to_string(), format_mtp_datetime(node.created)),
-                    ("修改时间".to_string(), format_mtp_datetime(node.modified)),
+                    (tr("Kind"), node.kind),
+                    (
+                        tr("Items"),
+                        tr("{count} items").replace("{count}", &node.children.len().to_string()),
+                    ),
+                    (tr("Created"), format_mtp_datetime(node.created)),
+                    (tr("Modified"), format_mtp_datetime(node.modified)),
                 ],
             ),
             Some(node) => (
                 node.name.to_string(),
                 node.note.clone(),
                 vec![
-                    ("类型".to_string(), node.kind),
-                    ("项目".to_string(), format!("{} 个", node.children.len())),
+                    (tr("Kind"), node.kind),
+                    (
+                        tr("Items"),
+                        tr("{count} items").replace("{count}", &node.children.len().to_string()),
+                    ),
                 ],
             ),
             None => match selected_device.as_ref() {
@@ -828,22 +836,22 @@ impl Delegate {
                     self.device_list_name(device),
                     String::new(),
                     vec![
-                        ("状态".to_string(), self.mount_status(device.location_id)),
-                        ("制造商".to_string(), self.device_manufacturer(device)),
+                        (tr("Status"), self.mount_status(device.location_id)),
+                        (tr("Manufacturer"), self.device_manufacturer(device)),
                         (
-                            "序列号".to_string(),
+                            tr("Serial Number"),
                             device
                                 .serial_number
                                 .as_deref()
-                                .unwrap_or("未提供")
+                                .unwrap_or(&tr("Not Provided"))
                                 .to_string(),
                         ),
-                        ("位置".to_string(), format!("{:08x}", device.location_id)),
+                        (tr("Location"), format!("{:08x}", device.location_id)),
                     ],
                 ),
                 None => (
-                    "未选择文件".to_string(),
-                    "选择 MTP 设备后展开目录".to_string(),
+                    tr("No File Selected"),
+                    tr("Select an MTP device, then expand a directory."),
                     Vec::new(),
                 ),
             },
@@ -891,7 +899,7 @@ impl Delegate {
         match result {
             Err(err) => {
                 self.ivars().devices.borrow_mut().clear();
-                self.set_message("设备扫描失败", &format!("{err}"));
+                self.set_message(&tr("Device Scan Failed"), &format!("{err}"));
             }
             Ok(found) if found.is_empty() => {
                 self.ivars().devices.borrow_mut().clear();
@@ -900,8 +908,8 @@ impl Delegate {
                     self.clear_browser_state();
                 }
                 self.set_message(
-                    "未发现 MTP 设备",
-                    "连接 Android/Kindle 等 MTP 设备后点击左侧刷新按钮。",
+                    &tr("No MTP Devices Found"),
+                    &tr("Connect an Android, Kindle, or other MTP device, then click Refresh."),
                 );
             }
             Ok(found) => {
@@ -916,7 +924,10 @@ impl Delegate {
                 }
                 *self.ivars().devices.borrow_mut() = found;
                 if current_location.is_none() {
-                    self.set_message("请选择设备", "从左侧设备栏选择一个 MTP 设备。");
+                    self.set_message(
+                        &tr("Select a Device"),
+                        &tr("Select an MTP device from the left device list."),
+                    );
                 }
             }
         }
@@ -959,7 +970,7 @@ impl Delegate {
                 .pending_mount_location
                 .replace(Some(device_info.location_id));
         }
-        self.set_browser_message("正在连接设备", &device_info.display());
+        self.set_browser_message(&tr("Connecting Device"), &device_info.display());
         self.update_detail();
         self.update_mount_controls();
         self.start_device_connect(device_info, mtp_lock);
@@ -967,7 +978,10 @@ impl Delegate {
 
     fn start_device_connect(&self, device_info: MtpDeviceInfo, mtp_lock: Arc<Mutex<()>>) {
         let Some(tx) = self.ivars().device_events_tx.get().cloned() else {
-            self.set_browser_message("连接设备失败", "设备事件通道未初始化。");
+            self.set_browser_message(
+                &tr("Device Connection Failed"),
+                &tr("Device event channel is not initialized."),
+            );
             return;
         };
         self.update_mount_controls();
@@ -1022,8 +1036,8 @@ impl Delegate {
         }
 
         self.set_message(
-            "已连接设备",
-            "可使用内置浏览器浏览文件，或使用右侧按钮挂载到系统。",
+            &tr("Device Connected"),
+            &tr("Browse files with the built-in browser, or use the right-side button to mount the device in the system."),
         );
         self.update_detail();
     }
@@ -1034,11 +1048,17 @@ impl Delegate {
         };
         let location_id = device_info.location_id;
         if *self.ivars().current_mount_location.borrow() == Some(location_id) {
-            self.set_message("已挂载", "这个设备已经挂载。");
+            self.set_message(
+                &tr("Already Mounted"),
+                &tr("This device is already mounted."),
+            );
             return;
         }
         if *self.ivars().current_mounting_location.borrow() == Some(location_id) {
-            self.set_message("正在挂载", "请等待这个设备的挂载操作完成。");
+            self.set_message(
+                &tr("Mounting"),
+                &tr("Wait for this device's mount operation to finish."),
+            );
             return;
         }
         if *self.ivars().current_device_location.borrow() != Some(location_id) {
@@ -1057,13 +1077,19 @@ impl Delegate {
             return;
         };
         if *self.ivars().current_mount_location.borrow() != Some(device_info.location_id) {
-            self.set_message("未挂载", "这个设备当前没有挂载。");
+            self.set_message(
+                &tr("Not Mounted"),
+                &tr("This device is not currently mounted."),
+            );
             return;
         }
         self.eject_current_mount();
         self.ivars().current_mount_location.borrow_mut().take();
         self.update_mount_controls();
-        self.set_message("已推出", "内置浏览器仍可继续使用当前设备。");
+        self.set_message(
+            &tr("Ejected"),
+            &tr("The built-in browser can still use the current device."),
+        );
     }
 
     fn mount_current_device(&self, device: MtpDevice, device_info: &MtpDeviceInfo) {
@@ -1071,21 +1097,27 @@ impl Delegate {
         self.ivars().current_mount_location.borrow_mut().take();
         if !mount::macfuse_available() {
             self.set_message(
-                "已连接设备",
-                "未检测到 macFUSE，保留内置浏览器模式。安装 macFUSE 后可挂载到系统。",
+                &tr("Device Connected"),
+                &tr("macFUSE was not detected, so built-in browser mode remains active. Install macFUSE to mount devices in the system."),
             );
             self.update_mount_controls();
             return;
         }
 
         let Some(tx) = self.ivars().mount_events_tx.get().cloned() else {
-            self.set_message("挂载失败", "挂载事件通道未初始化，仍可使用内置浏览器。");
+            self.set_message(
+                &tr("Mount Failed"),
+                &tr("Mount event channel is not initialized. The built-in browser remains available."),
+            );
             return;
         };
         let device_info = device_info.clone();
         let location_id = device_info.location_id;
         let mtp_lock = self.mtp_lock_for_device(location_id);
-        self.set_message("正在挂载", "内置浏览器已可使用，挂载将在后台完成。");
+        self.set_message(
+            &tr("Mounting"),
+            &tr("The built-in browser is available. Mounting will finish in the background."),
+        );
         self.ivars()
             .current_mounting_location
             .replace(Some(location_id));
@@ -1103,7 +1135,7 @@ impl Delegate {
         if let Err(message) = self.load_children_result(index, None) {
             let mut nodes = self.ivars().nodes.borrow_mut();
             let child = nodes.len();
-            nodes.push(message_node("目录读取失败", &message));
+            nodes.push(message_node(&tr("Directory Read Failed"), &message));
             nodes[index].children = vec![child];
             nodes[index].children_loaded = true;
         }
@@ -1111,7 +1143,7 @@ impl Delegate {
 
     fn load_children_result(&self, index: usize, timeout: Option<Duration>) -> Result<(), String> {
         let Some(device) = self.ivars().device.borrow().clone() else {
-            return Err("设备未连接。".to_string());
+            return Err(tr("Device is not connected."));
         };
         if self
             .ivars()
@@ -1145,7 +1177,10 @@ impl Delegate {
                 match timeout {
                     Some(timeout) => tokio::time::timeout(timeout, operation)
                         .await
-                        .map_err(|_| format!("MTP 目录读取超过 {} 秒。", timeout.as_secs()))?
+                        .map_err(|_| {
+                            tr("MTP directory read exceeded {seconds} seconds.")
+                                .replace("{seconds}", &timeout.as_secs().to_string())
+                        })?
                         .map_err(|err| format_mtp_error(&err)),
                     None => operation.await.map_err(|err| format_mtp_error(&err)),
                 }
@@ -1166,7 +1201,7 @@ impl Delegate {
             children.push(child);
             nodes.push(BrowserNode {
                 name: object.filename.clone(),
-                kind: if is_folder { "文件夹" } else { "文件" }.to_string(),
+                kind: if is_folder { tr("Folder") } else { tr("File") },
                 size: if is_folder {
                     "--".to_string()
                 } else {
@@ -1174,7 +1209,7 @@ impl Delegate {
                 },
                 created: object.created,
                 modified: object.modified,
-                note: "选中文件按下空格预览文件\n选中后拖拽到Finder可复制文件到本机".to_string(),
+                note: tr("Select a file and press Space to preview it.\nDrag selected items to Finder to copy files to this Mac."),
                 source: NodeSource::Object {
                     storage_id,
                     handle: object.handle,
@@ -1210,7 +1245,10 @@ impl Delegate {
             }
         };
 
-        self.set_message("正在准备预览", "正在从 MTP 设备复制文件到临时目录。");
+        self.set_message(
+            &tr("Preparing Preview"),
+            &tr("Copying the file from the MTP device to a temporary directory."),
+        );
         let device = self.ivars().device.borrow().clone()?;
         let result = self.with_mtp_lock(self.current_mtp_lock().as_ref(), || {
             self.runtime().block_on(async {
@@ -1221,11 +1259,11 @@ impl Delegate {
         let data = match result {
             Ok(Ok(data)) => data,
             Ok(Err(err)) => {
-                self.set_message("预览失败", &format_mtp_error(&err));
+                self.set_message(&tr("Preview Failed"), &format_mtp_error(&err));
                 return None;
             }
             Err(message) => {
-                self.set_message("预览失败", &message);
+                self.set_message(&tr("Preview Failed"), &message);
                 return None;
             }
         };
@@ -1239,7 +1277,10 @@ impl Delegate {
             }
         }
         if fs::write(&path, data).is_err() {
-            self.set_message("预览失败", "无法写入临时预览文件。");
+            self.set_message(
+                &tr("Preview Failed"),
+                &tr("Unable to write the temporary preview file."),
+            );
             return None;
         }
         self.ivars().nodes.borrow_mut()[index].cached_path = Some(path.clone());
@@ -1266,12 +1307,16 @@ impl Delegate {
         let objects = NSArray::from_retained_slice(&promises);
         if pasteboard.writeObjects(&objects) {
             self.set_message(
-                "可以拖拽复制",
-                &format!("已准备 {} 个文件承诺，松开鼠标后开始复制。", promises.len()),
+                &tr("Ready to Drag Copy"),
+                &tr("Prepared {count} file promises. Release the mouse to start copying.")
+                    .replace("{count}", &promises.len().to_string()),
             );
             true
         } else {
-            self.set_message("拖拽复制失败", "无法写入拖拽剪贴板。");
+            self.set_message(
+                &tr("Drag Copy Failed"),
+                &tr("Unable to write to the drag pasteboard."),
+            );
             false
         }
     }
@@ -1284,36 +1329,39 @@ impl Delegate {
     ) -> Result<(), String> {
         let index = self
             .file_promise_index(provider)
-            .ok_or_else(|| "找不到拖拽项目。".to_string())?;
+            .ok_or_else(|| tr("Drag item was not found."))?;
         let path = url
             .path()
             .map(|path| PathBuf::from(path.to_string()))
-            .ok_or_else(|| "Finder没有提供有效目标路径。".to_string())?;
+            .ok_or_else(|| tr("Finder did not provide a valid destination path."))?;
         let job = self
             .export_node(index)
-            .ok_or_else(|| "只能拖拽 MTP 文件或文件夹。".to_string())?;
+            .ok_or_else(|| tr("Only MTP files or folders can be dragged."))?;
         let device = self
             .ivars()
             .device
             .borrow()
             .clone()
-            .ok_or_else(|| "设备未连接。".to_string())?;
+            .ok_or_else(|| tr("Device is not connected."))?;
         let tx = self
             .ivars()
             .copy_events_tx
             .get()
             .cloned()
-            .ok_or_else(|| "复制进度通道未初始化。".to_string())?;
+            .ok_or_else(|| tr("Copy progress channel is not initialized."))?;
         let mtp_lock = self
             .current_mtp_lock()
-            .ok_or_else(|| "设备操作锁未初始化。".to_string())?;
+            .ok_or_else(|| tr("Device operation lock is not initialized."))?;
         let active_copies = self.ivars().active_copies.clone();
         if active_copies.load(Ordering::SeqCst) == 0 {
             *self.ivars().copy_error.borrow_mut() = None;
         }
         active_copies.fetch_add(1, Ordering::SeqCst);
 
-        self.set_message("正在复制拖拽项目", "正在从 MTP 设备复制到目标位置。");
+        self.set_message(
+            &tr("Copying Dragged Items"),
+            &tr("Copying from the MTP device to the destination."),
+        );
         self.show_copy_progress(true);
         self.set_mtp_controls_enabled(false);
         let _ = tx.send(CopyEvent::Started);
@@ -1355,7 +1403,7 @@ impl Delegate {
         if self.ivars().active_copies.load(Ordering::SeqCst) == 0 {
             return false;
         }
-        self.set_message("MTP 正在复制", detail);
+        self.set_message(&tr("MTP Copying"), detail);
         true
     }
 
@@ -1381,10 +1429,10 @@ impl Delegate {
         mtp_lock: Option<&Arc<Mutex<()>>>,
         operation: impl FnOnce() -> T,
     ) -> Result<T, String> {
-        let mtp_lock = mtp_lock.ok_or_else(|| "设备操作锁未初始化。".to_string())?;
+        let mtp_lock = mtp_lock.ok_or_else(|| tr("Device operation lock is not initialized."))?;
         let _guard = mtp_lock
             .lock()
-            .map_err(|_| "MTP 操作锁已损坏。".to_string())?;
+            .map_err(|_| tr("MTP operation lock is poisoned."))?;
         Ok(operation())
     }
 
@@ -1463,9 +1511,12 @@ impl Delegate {
                 self.show_copy_progress(false);
                 self.set_mtp_controls_enabled(true);
                 if let Some(message) = self.ivars().copy_error.borrow_mut().take() {
-                    self.set_message("拖拽复制失败", &message);
+                    self.set_message(&tr("Drag Copy Failed"), &message);
                 } else if result.is_ok() {
-                    self.set_message("拖拽复制完成", "文件已复制到目标位置。");
+                    self.set_message(
+                        &tr("Drag Copy Complete"),
+                        &tr("Files were copied to the destination."),
+                    );
                 }
             }
         }
@@ -1502,7 +1553,7 @@ impl Delegate {
                 self.ivars().current_device_location.borrow_mut().take();
                 self.ivars().current_mtp_lock.borrow_mut().take();
                 self.update_mount_controls();
-                self.set_browser_message("连接设备失败", &message);
+                self.set_browser_message(&tr("Device Connection Failed"), &message);
             }
         }
     }
@@ -1546,15 +1597,20 @@ impl Delegate {
                     .replace(Some(location_id));
                 self.update_mount_controls();
                 self.set_message(
-                    "已挂载到 Finder",
-                    &format!("设备已挂载到 {path}。退出前会自动推出。"),
+                    &tr("Mounted in Finder"),
+                    &tr("The device is mounted at {path}. It will be ejected automatically before quitting.")
+                        .replace("{path}", &path),
                 );
             }
             Err(message) => {
                 self.update_mount_controls();
                 self.set_message(
-                    "Finder 挂载失败",
-                    &format!("{message}\n仍可使用内置浏览器。"),
+                    &tr("Finder Mount Failed"),
+                    &format!(
+                        "{}\n{}",
+                        message,
+                        tr("The built-in browser remains available.")
+                    ),
                 );
             }
         }
@@ -1581,15 +1637,20 @@ impl Delegate {
         }
         let detail = match bytes_total {
             Some(total) if total > 0 => format!(
-                "{}\n已完成 {} / {}，共 {} 个文件。",
+                "{}\n{}",
                 name,
-                format_bytes(bytes_done),
-                format_bytes(total),
-                files_done
+                tr("Completed {done} / {total}, {files} files total.")
+                    .replace("{done}", &format_bytes(bytes_done))
+                    .replace("{total}", &format_bytes(total))
+                    .replace("{files}", &files_done.to_string())
             ),
-            _ => format!("{}\n已复制 {} 个文件。", name, files_done),
+            _ => format!(
+                "{}\n{}",
+                name,
+                tr("Copied {files} files.").replace("{files}", &files_done.to_string())
+            ),
         };
-        self.set_message("正在复制拖拽项目", &detail);
+        self.set_message(&tr("Copying Dragged Items"), &detail);
     }
 
     fn show_copy_progress(&self, visible: bool) {
@@ -1649,7 +1710,7 @@ impl Delegate {
         let row_height = 30.0;
         let mut y = (bounds.size.height - header_height).max(0.0);
 
-        let header = NSTextField::labelWithString(ns_string!("信息"), self.mtm());
+        let header = NSTextField::labelWithString(&ns_tr("Info"), self.mtm());
         header.setFrame(NSRect::new(
             NSPoint::new(0.0, y),
             NSSize::new(width, header_height),
@@ -1733,7 +1794,7 @@ impl Delegate {
             .as_deref()
             .map(str::trim)
             .filter(|name| !name.is_empty())
-            .unwrap_or("MTP 设备")
+            .unwrap_or(&tr("MTP Device"))
             .to_string()
     }
 
@@ -1743,19 +1804,19 @@ impl Delegate {
             .as_deref()
             .map(str::trim)
             .filter(|name| !name.is_empty())
-            .unwrap_or("未提供")
+            .unwrap_or(&tr("Not Provided"))
             .to_string()
     }
 
     fn mount_status(&self, location_id: u64) -> String {
         if *self.ivars().current_mount_location.borrow() == Some(location_id) {
-            "已挂载到 Finder".to_string()
+            tr("Mounted in Finder")
         } else if *self.ivars().current_mounting_location.borrow() == Some(location_id) {
-            "正在挂载到 Finder".to_string()
+            tr("Mounting in Finder")
         } else if *self.ivars().current_device_location.borrow() == Some(location_id) {
-            "已连接，未挂载".to_string()
+            tr("Connected, Not Mounted")
         } else {
-            "未连接".to_string()
+            tr("Not Connected")
         }
     }
 
@@ -1827,7 +1888,7 @@ impl Delegate {
                 NSAutoresizingMaskOptions::ViewMinYMargin
                     | NSAutoresizingMaskOptions::ViewWidthSizable,
             );
-            let label = NSTextField::labelWithString(ns_string!("未发现 MTP 设备"), self.mtm());
+            let label = NSTextField::labelWithString(&ns_tr("No MTP Devices Found"), self.mtm());
             label.setFrame(NSRect::new(
                 NSPoint::new(6.0, 5.0),
                 NSSize::new((list_width - 12.0).max(0.0), 20.0),
@@ -1911,7 +1972,7 @@ impl Delegate {
 
             if let Some(icon) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
                 ns_string!("externaldrive"),
-                Some(ns_string!("MTP device")),
+                Some(&ns_tr("MTP device")),
             ) {
                 let image_view = NSImageView::imageViewWithImage(&icon, self.mtm());
                 image_view.setFrame(NSRect::new(
@@ -1996,11 +2057,11 @@ fn run_copy_worker(
 ) -> Result<(), String> {
     let _guard = mtp_lock
         .lock()
-        .map_err(|_| "MTP 操作锁已损坏。".to_string())?;
+        .map_err(|_| tr("MTP operation lock is poisoned."))?;
     let runtime = Builder::new_current_thread()
         .enable_all()
         .build()
-        .map_err(|err| format!("无法创建复制运行时: {err}"))?;
+        .map_err(|err| format!("{}: {err}", tr("Unable to create copy runtime")))?;
     let mut state = CopyState {
         files_done: 0,
         last_progress: Instant::now() - COPY_PROGRESS_THROTTLE,
@@ -2015,11 +2076,16 @@ fn run_device_connect_worker(
 ) -> Result<(MtpDevice, Vec<BrowserNode>, Vec<usize>), String> {
     let _guard = mtp_lock
         .lock()
-        .map_err(|_| "MTP 操作锁已损坏。".to_string())?;
+        .map_err(|_| tr("MTP operation lock is poisoned."))?;
     let runtime = Builder::new_current_thread()
         .enable_all()
         .build()
-        .map_err(|err| format!("无法创建设备连接运行时: {err}"))?;
+        .map_err(|err| {
+            format!(
+                "{}: {err}",
+                tr("Unable to create device connection runtime")
+            )
+        })?;
     let device = runtime
         .block_on(MtpDevice::open_by_location(device_info.location_id))
         .map_err(|err| format_mtp_error(&err))?;
@@ -2039,13 +2105,15 @@ fn storage_nodes(storages: Vec<mtp_rs::Storage>) -> (Vec<BrowserNode>, Vec<usize
         roots.push(index);
         nodes.push(BrowserNode {
             name: info.description.clone(),
-            kind: "存储".to_string(),
+            kind: tr("Storage"),
             size: format_bytes(info.free_space_bytes),
             created: None,
             modified: None,
             note: format!(
-                "Storage ID: {}\n可用空间: {}",
+                "{}: {}\n{}: {}",
+                tr("Storage ID"),
                 storage.id().0,
+                tr("Free Space"),
                 format_bytes(info.free_space_bytes)
             ),
             source: NodeSource::Storage {
@@ -2060,8 +2128,8 @@ fn storage_nodes(storages: Vec<mtp_rs::Storage>) -> (Vec<BrowserNode>, Vec<usize
 
     if roots.is_empty() {
         nodes.push(message_node(
-            "设备没有可用存储",
-            "MTP 设备未返回 storage 列表。",
+            &tr("Device Has No Available Storage"),
+            &tr("The MTP device did not return a storage list."),
         ));
         roots.push(0);
     }
@@ -2094,7 +2162,8 @@ async fn export_file_worker(
     state: &mut CopyState,
 ) -> Result<(), String> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|err| format!("无法创建目标目录: {err}"))?;
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("{}: {err}", tr("Unable to create destination directory")))?;
     }
 
     let storage = device
@@ -2106,12 +2175,13 @@ async fn export_file_worker(
         .await
         .map_err(|err| format_mtp_error(&err))?;
     let total = download.size();
-    let mut file = fs::File::create(path).map_err(|err| format!("无法写入文件: {err}"))?;
+    let mut file =
+        fs::File::create(path).map_err(|err| format!("{}: {err}", tr("Unable to write file")))?;
 
     while let Some(chunk) = download.next_chunk().await {
         let chunk = chunk.map_err(|err| format_mtp_error(&err))?;
         file.write_all(&chunk)
-            .map_err(|err| format!("无法写入文件: {err}"))?;
+            .map_err(|err| format!("{}: {err}", tr("Unable to write file")))?;
         if state.last_progress.elapsed() >= COPY_PROGRESS_THROTTLE {
             state.last_progress = Instant::now();
             let _ = state.tx.send(CopyEvent::Progress {
@@ -2122,7 +2192,8 @@ async fn export_file_worker(
             });
         }
     }
-    file.flush().map_err(|err| format!("无法写入文件: {err}"))?;
+    file.flush()
+        .map_err(|err| format!("{}: {err}", tr("Unable to write file")))?;
     state.files_done += 1;
     let _ = state.tx.send(CopyEvent::Progress {
         name: node.name.clone(),
@@ -2139,7 +2210,7 @@ async fn export_folder_worker(
     path: &PathBuf,
     state: &mut CopyState,
 ) -> Result<(), String> {
-    fs::create_dir_all(path).map_err(|err| format!("无法创建文件夹: {err}"))?;
+    fs::create_dir_all(path).map_err(|err| format!("{}: {err}", tr("Unable to create folder")))?;
     let _ = state.tx.send(CopyEvent::Progress {
         name: node.name.clone(),
         bytes_done: 0,

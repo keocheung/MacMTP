@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use mtp_rs::ptp::DateTime;
 use mtp_rs::{ObjectHandle, StorageId};
 
+use crate::loc::tr;
+
 #[derive(Clone, Debug)]
 pub struct BrowserNode {
     pub name: String,
@@ -56,7 +58,7 @@ impl BrowserNode {
 pub fn message_node(title: &str, detail: &str) -> BrowserNode {
     BrowserNode {
         name: title.to_string(),
-        kind: "状态".to_string(),
+        kind: tr("Status"),
         size: "--".to_string(),
         created: None,
         modified: None,

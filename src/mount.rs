@@ -20,6 +20,7 @@ use mtp_rs::{ObjectHandle, StorageId};
 use tokio::runtime::Builder;
 use unicode_normalization::UnicodeNormalization;
 
+use crate::loc::tr;
 use crate::util::{format_mtp_error, mtp_datetime_to_system_time, sanitize_filename};
 
 const ROOT_INO: u64 = 1;
@@ -63,7 +64,7 @@ pub fn mount_device(
     mtp_lock: Arc<Mutex<()>>,
 ) -> Result<MountHandle, String> {
     if !macfuse_available() {
-        return Err("未检测到 macFUSE，跳过挂载。".to_string());
+        return Err(tr("macFUSE was not detected, skipping mount."));
     }
 
     let volume_name = volume_name(device_info);
@@ -71,7 +72,8 @@ pub fn mount_device(
     let mountpoint = unique_mountpoint(&volume_name)?;
     let cache_dir =
         std::env::temp_dir().join(format!("macmtp-fuse-cache-{}", device_info.location_id));
-    fs::create_dir_all(&cache_dir).map_err(|err| format!("无法创建 FUSE 缓存目录: {err}"))?;
+    fs::create_dir_all(&cache_dir)
+        .map_err(|err| format!("{}: {err}", tr("Unable to create FUSE cache directory")))?;
 
     let fs = MtpFuseFs::new(device, mtp_lock, cache_dir.clone());
     let options = vec![
@@ -88,7 +90,7 @@ pub fn mount_device(
     let mut config = Config::default();
     config.mount_options = options;
     let session = fuser::spawn_mount2(fs, &mountpoint, &config)
-        .map_err(|err| format!("FUSE 挂载失败: {err}"))?;
+        .map_err(|err| format!("{}: {err}", tr("FUSE mount failed")))?;
 
     Ok(MountHandle {
         mountpoint,
@@ -127,7 +129,9 @@ fn unique_mountpoint(volume_name: &str) -> Result<PathBuf, String> {
             return Ok(candidate);
         }
     }
-    Err("无法找到可用的 /Volumes/MacMTP 挂载点名称。".to_string())
+    Err(tr(
+        "Unable to find an available /Volumes/MacMTP mount point name.",
+    ))
 }
 
 fn cleanup_existing_mountpoints(volume_name: &str) {
