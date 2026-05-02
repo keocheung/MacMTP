@@ -1,4 +1,6 @@
 "Already Mounted" = "已挂载";
+"After authorizing file access on the phone, click Refresh in MacMTP." = "在手机上允许文件访问后，点击 MacMTP 的刷新按钮。";
+"Allow File Access on Device" = "请在设备上允许文件访问";
 "Browse files with the built-in browser, or use the right-side button to mount the device in the system." = "可使用内置浏览器浏览文件，或使用右侧按钮挂载到系统。";
 "Completed {done} / {total}, {files} files total." = "已完成 {done} / {total}，共 {files} 个文件。";
 "Connect an Android, Kindle, or other MTP device, then click Refresh." = "连接 Android、Kindle 等 MTP 设备后点击刷新按钮。";
@@ -63,6 +65,7 @@
 "Not Mounted" = "未挂载";
 "Not Provided" = "未提供";
 "Only MTP files or folders can be dragged." = "只能拖拽 MTP 文件或文件夹。";
+"OK" = "好";
 "Open Finder" = "打开 Finder";
 "Prepared {count} file promises. Release the mouse to start copying." = "已准备 {count} 个文件承诺，松开鼠标后开始复制。";
 "Preparing Preview" = "正在准备预览";

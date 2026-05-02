@@ -18,9 +18,9 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, ProtocolObject};
 use objc2::{AnyThread, DefinedClass, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSAutoresizingMaskOptions,
-    NSBackingStoreType, NSBox, NSBoxType, NSButton, NSCellImagePosition, NSColor,
-    NSControlTextEditingDelegate, NSDragOperation, NSDraggingSession, NSEvent,
+    NSAlert, NSAlertStyle, NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
+    NSAutoresizingMaskOptions, NSBackingStoreType, NSBox, NSBoxType, NSButton, NSCellImagePosition,
+    NSColor, NSControlTextEditingDelegate, NSDragOperation, NSDraggingSession, NSEvent,
     NSFilePromiseProvider, NSFilePromiseProviderDelegate, NSFont, NSImage, NSImageView,
     NSLineBreakMode, NSOutlineView, NSOutlineViewDataSource, NSOutlineViewDelegate, NSPasteboard,
     NSPasteboardWriting, NSProgressIndicator, NSSplitView, NSSplitViewDelegate, NSTableColumn,
@@ -645,6 +645,18 @@ impl Delegate {
         self.set_message(title, detail);
     }
 
+    fn show_authorize_then_refresh_alert(&self) {
+        let alert = NSAlert::new(self.mtm());
+        alert.setAlertStyle(NSAlertStyle::Informational);
+        alert.setMessageText(&ns_tr("Allow File Access on Device"));
+        alert.setInformativeText(&ns_tr(
+            "After authorizing file access on the phone, click Refresh in MacMTP.",
+        ));
+        alert.addButtonWithTitle(&ns_tr("OK"));
+        let _ = alert.runModal();
+        self.refresh_devices();
+    }
+
     fn clear_browser_roots(&self) {
         self.ivars().root_children.borrow_mut().clear();
         self.reload_outline();
@@ -669,6 +681,60 @@ impl Delegate {
             });
         }
         self.update_mount_controls();
+    }
+
+    fn reconnect_current_device(&self, device_info: MtpDeviceInfo) {
+        self.clear_outline_selection();
+        self.clear_browser_roots();
+        self.close_current_device();
+
+        let mtp_lock = self.mtp_lock_for_device(device_info.location_id);
+        self.ivars()
+            .current_device_location
+            .replace(Some(device_info.location_id));
+        self.ivars()
+            .current_mtp_lock
+            .replace(Some(mtp_lock.clone()));
+        self.ivars()
+            .device_storages
+            .borrow_mut()
+            .remove(&device_info.location_id);
+        self.set_browser_message(
+            &tr("Connecting Device"),
+            &tr("Unlock the Android device, choose File Transfer / MTP, and allow access if prompted."),
+        );
+        self.update_detail();
+        self.update_mount_controls();
+        self.start_device_connect(device_info, mtp_lock);
+    }
+
+    fn should_reconnect_current_device_for_refresh(&self, location_id: u64) -> bool {
+        if self.ivars().device.borrow().is_none() {
+            return false;
+        }
+        if self
+            .ivars()
+            .current_mounts
+            .borrow()
+            .keys()
+            .any(|key| key.location_id == location_id)
+        {
+            return false;
+        }
+        if self
+            .ivars()
+            .current_mounting_storages
+            .borrow()
+            .iter()
+            .any(|key| key.location_id == location_id)
+        {
+            return false;
+        }
+        self.ivars()
+            .device_storages
+            .borrow()
+            .get(&location_id)
+            .is_some_and(Vec::is_empty)
     }
 
     fn eject_mount(&self, key: StorageKey) -> bool {
@@ -1027,7 +1093,14 @@ impl Delegate {
                         &tr("Select an MTP device from the left device list."),
                     );
                 }
-                self.refresh_current_storages();
+                if let Some(current_location) = current_location
+                    && self.should_reconnect_current_device_for_refresh(current_location)
+                    && let Some(device_info) = self.device_info_for_location(current_location)
+                {
+                    self.reconnect_current_device(device_info);
+                } else {
+                    self.refresh_current_storages();
+                }
             }
         }
         self.update_mount_controls();
@@ -1138,6 +1211,7 @@ impl Delegate {
         }
 
         let pending_mount = *self.ivars().pending_mount_storage.borrow();
+        let no_storages = storages.is_empty();
         self.ivars()
             .device_storages
             .borrow_mut()
@@ -1158,6 +1232,13 @@ impl Delegate {
             &tr("Device Connected"),
             &tr("Browse files with the built-in browser, or use the right-side button to mount the device in the system."),
         );
+        if no_storages {
+            self.set_message(
+                &tr("Device Has No Available Storage"),
+                &tr("After authorizing file access on the phone, click Refresh in MacMTP."),
+            );
+            self.show_authorize_then_refresh_alert();
+        }
         self.update_detail();
     }
 
@@ -1171,6 +1252,7 @@ impl Delegate {
         if *self.ivars().current_device_location.borrow() != Some(location_id) {
             return;
         }
+        let no_storages = storages.is_empty();
         self.ivars()
             .device_storages
             .borrow_mut()
@@ -1179,6 +1261,13 @@ impl Delegate {
         self.apply_selected_storage_root(&roots);
         self.update_detail();
         self.update_mount_controls();
+        if no_storages {
+            self.set_message(
+                &tr("Device Has No Available Storage"),
+                &tr("After authorizing file access on the phone, click Refresh in MacMTP."),
+            );
+            self.show_authorize_then_refresh_alert();
+        }
     }
 
     fn apply_selected_storage_root(&self, _fallback_roots: &[usize]) {
@@ -2663,7 +2752,7 @@ fn storage_nodes(storages: Vec<mtp_rs::Storage>) -> (Vec<BrowserNode>, Vec<usize
     if roots.is_empty() {
         nodes.push(message_node(
             &tr("Device Has No Available Storage"),
-            &tr("The MTP device did not return a storage list. Unlock the device, allow file access on the phone, choose File Transfer / MTP, then refresh."),
+            &tr("After authorizing file access on the phone, click Refresh in MacMTP."),
         ));
         roots.push(0);
     }

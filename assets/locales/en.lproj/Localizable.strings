@@ -1,4 +1,6 @@
 "Already Mounted" = "Already Mounted";
+"After authorizing file access on the phone, click Refresh in MacMTP." = "After authorizing file access on the phone, click Refresh in MacMTP.";
+"Allow File Access on Device" = "Allow File Access on Device";
 "Browse files with the built-in browser, or use the right-side button to mount the device in the system." = "Browse files with the built-in browser, or use the right-side button to mount the device in the system.";
 "Completed {done} / {total}, {files} files total." = "Completed {done} / {total}, {files} files total.";
 "Connect an Android, Kindle, or other MTP device, then click Refresh." = "Connect an Android, Kindle, or other MTP device, then click Refresh.";
@@ -63,6 +65,7 @@
 "Not Mounted" = "Not Mounted";
 "Not Provided" = "Not Provided";
 "Only MTP files or folders can be dragged." = "Only MTP files or folders can be dragged.";
+"OK" = "OK";
 "Open Finder" = "Open Finder";
 "Prepared {count} file promises. Release the mouse to start copying." = "Prepared {count} file promises. Release the mouse to start copying.";
 "Preparing Preview" = "Preparing Preview";
