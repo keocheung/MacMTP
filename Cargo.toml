@@ -12,3 +12,8 @@ objc2-foundation = "0.3.2"
 objc2-quartz = "0.3.2"
 mtp-rs = "0.13.2"
 tokio = { version = "1", features = ["rt", "time"] }
+
+[package.metadata.packager]
+identifier = "moe.keo.macmtp"
+icons = ["assets/icons/*.png"]
+before-packaging-command = "cargo build --release"
