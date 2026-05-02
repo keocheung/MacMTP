@@ -5,16 +5,15 @@ macOS 的 MTP 设备文件浏览器，支持从 Android 手机、Kindle、Ninten
 ## 功能特性
 
 - 扫描和连接 MTP 设备
-- 检测到 macFUSE 时可手动挂载到 Finder，并在退出前推出
+- 检测到 [macFUSE](https://macfuse.github.io/) 时可手动挂载到 macOS
 - 树形目录浏览设备存储和文件
 - 拖拽文件到 Finder 复制到本机
 - 空格键 Quick Look 预览文件
-- 显示文件大小、存储信息等详情
 
 ## 要求
 
 - macOS 10.15+
-- macFUSE（可选；安装后启用 Finder 挂载）
+- macFUSE（可选；安装后启用挂载）
 - Rust 工具链 (edition 2024)
 
 ## 构建与运行
