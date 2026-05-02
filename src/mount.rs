@@ -63,7 +63,7 @@ pub fn mount_device(
     mtp_lock: Arc<Mutex<()>>,
 ) -> Result<MountHandle, String> {
     if !macfuse_available() {
-        return Err("未检测到 macFUSE，跳过 Finder 挂载。".to_string());
+        return Err("未检测到 macFUSE，跳过挂载。".to_string());
     }
 
     let volume_name = volume_name(device_info);

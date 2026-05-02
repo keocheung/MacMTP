@@ -18,11 +18,12 @@ use objc2::runtime::{AnyClass, AnyObject, ProtocolObject};
 use objc2::{AnyThread, DefinedClass, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSAutoresizingMaskOptions,
-    NSBackingStoreType, NSButton, NSColor, NSControlTextEditingDelegate, NSDragOperation,
-    NSDraggingSession, NSEvent, NSFilePromiseProvider, NSFilePromiseProviderDelegate, NSFont,
-    NSLineBreakMode, NSOutlineView, NSOutlineViewDataSource, NSOutlineViewDelegate, NSPasteboard,
-    NSPasteboardWriting, NSProgressIndicator, NSTableColumn, NSTextField, NSView, NSWindow,
-    NSWindowDelegate, NSWindowStyleMask, NSWorkspace,
+    NSBackingStoreType, NSBox, NSBoxType, NSButton, NSColor, NSControlTextEditingDelegate,
+    NSDragOperation, NSDraggingSession, NSEvent, NSFilePromiseProvider,
+    NSFilePromiseProviderDelegate, NSFont, NSImage, NSImageView, NSLineBreakMode, NSOutlineView,
+    NSOutlineViewDataSource, NSOutlineViewDelegate, NSPasteboard, NSPasteboardWriting,
+    NSProgressIndicator, NSSplitView, NSSplitViewDelegate, NSTableColumn, NSTextAlignment,
+    NSTextField, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask, NSWorkspace,
 };
 use objc2_foundation::{
     MainThreadMarker, NSArray, NSError, NSIndexSet, NSInteger, NSNotification, NSNumber, NSObject,
@@ -31,6 +32,7 @@ use objc2_foundation::{
 };
 use tokio::runtime::{Builder, Runtime};
 
+use crate::device_row::DeviceRowView;
 use crate::model::{BrowserNode, NodeSource, message_node};
 use crate::mount::{self, MountHandle};
 use crate::ui::{build_browser_ui, install_main_menu};
@@ -41,6 +43,9 @@ const FILE_PROMISE_TYPE_FILE: &str = "public.data";
 const FILE_PROMISE_TYPE_FOLDER: &str = "public.folder";
 const FILE_PROMISE_ERROR_DOMAIN: &str = "MacMTPFilePromiseError";
 const COPY_PROGRESS_THROTTLE: Duration = Duration::from_millis(120);
+const LEFT_SIDEBAR_MIN_WIDTH: f64 = 180.0;
+const RIGHT_SIDEBAR_MIN_WIDTH: f64 = 220.0;
+const BROWSER_MIN_WIDTH: f64 = 260.0;
 
 #[derive(Default)]
 pub(crate) struct AppDelegateIvars {
@@ -48,8 +53,11 @@ pub(crate) struct AppDelegateIvars {
     pub(crate) outline_view: OnceCell<Retained<NSOutlineView>>,
     pub(crate) device_list_view: OnceCell<Retained<NSView>>,
     pub(crate) refresh_button: OnceCell<Retained<NSButton>>,
+    pub(crate) detail_mount_button: OnceCell<Retained<NSButton>>,
+    pub(crate) detail_eject_button: OnceCell<Retained<NSButton>>,
     pub(crate) title_label: OnceCell<Retained<NSTextField>>,
     pub(crate) detail_label: OnceCell<Retained<NSTextField>>,
+    pub(crate) detail_info_view: OnceCell<Retained<NSView>>,
     pub(crate) progress_indicator: OnceCell<Retained<NSProgressIndicator>>,
     runtime: OnceCell<Runtime>,
     devices: RefCell<Vec<MtpDeviceInfo>>,
@@ -61,6 +69,7 @@ pub(crate) struct AppDelegateIvars {
     pending_mount_location: RefCell<Option<u64>>,
     current_mtp_lock: RefCell<Option<Arc<Mutex<()>>>>,
     device_row_views: RefCell<Vec<Retained<NSView>>>,
+    detail_info_rows: RefCell<Vec<Retained<NSView>>>,
     nodes: RefCell<Vec<BrowserNode>>,
     root_children: RefCell<Vec<usize>>,
     mtp_locks: RefCell<HashMap<u64, Arc<Mutex<()>>>>,
@@ -204,6 +213,51 @@ define_class!(
 
     unsafe impl NSOutlineViewDataSource for Delegate {}
     unsafe impl NSOutlineViewDelegate for Delegate {}
+    unsafe impl NSSplitViewDelegate for Delegate {
+        #[unsafe(method(splitView:shouldAdjustSizeOfSubview:))]
+        fn split_view_should_adjust_size_of_subview(
+            &self,
+            split_view: &NSSplitView,
+            view: &NSView,
+        ) -> bool {
+            let subviews = split_view.subviews();
+            if subviews.len() < 3 {
+                return true.into();
+            }
+            let browser = unsafe { subviews.objectAtIndex_unchecked(1) };
+            std::ptr::eq(browser, view).into()
+        }
+
+        #[unsafe(method(splitView:constrainSplitPosition:ofSubviewAt:))]
+        fn split_view_constrain_split_position(
+            &self,
+            split_view: &NSSplitView,
+            proposed_position: f64,
+            divider_index: NSInteger,
+        ) -> f64 {
+            let width = split_view.bounds().size.width;
+            let divider_width = 1.0;
+            match divider_index {
+                0 => {
+                    let max_left = width
+                        - RIGHT_SIDEBAR_MIN_WIDTH
+                        - BROWSER_MIN_WIDTH
+                        - (divider_width * 2.0);
+                    proposed_position.clamp(LEFT_SIDEBAR_MIN_WIDTH, max_left.max(LEFT_SIDEBAR_MIN_WIDTH))
+                }
+                1 => {
+                    let min_right_divider =
+                        LEFT_SIDEBAR_MIN_WIDTH + BROWSER_MIN_WIDTH + divider_width;
+                    let max_right_divider = width - RIGHT_SIDEBAR_MIN_WIDTH;
+                    proposed_position.clamp(
+                        min_right_divider.min(max_right_divider),
+                        max_right_divider,
+                    )
+                }
+                _ => proposed_position,
+            }
+        }
+    }
     unsafe impl NSControlTextEditingDelegate for Delegate {}
 
     unsafe impl NSFilePromiseProviderDelegate for Delegate {
@@ -733,28 +787,66 @@ impl Delegate {
     }
 
     fn update_detail(&self) {
-        let (title, detail) = match self.selected_node() {
+        let selected_device = self.selected_device_index().and_then(|index| {
+            self.ivars()
+                .devices
+                .borrow()
+                .get(index)
+                .map(|device| (index, device.clone()))
+        });
+        let (title, detail, rows) = match self.selected_node() {
             Some(node) if node.is_file() => (
                 node.name.to_string(),
-                format!("{}\n{}\n\n{}", node.kind, node.size, node.note),
+                node.note.clone(),
+                vec![
+                    ("类型".to_string(), node.kind),
+                    ("大小".to_string(), node.size),
+                    ("创建时间".to_string(), format_mtp_datetime(node.created)),
+                    ("修改时间".to_string(), format_mtp_datetime(node.modified)),
+                ],
             ),
             Some(node) if node.is_folder() => (
                 node.name.to_string(),
-                format!("{}\n{} 个项目\n\n{}", node.kind, node.children.len(), node.note),
+                node.note.clone(),
+                vec![
+                    ("类型".to_string(), node.kind),
+                    ("项目".to_string(), format!("{} 个", node.children.len())),
+                    ("创建时间".to_string(), format_mtp_datetime(node.created)),
+                    ("修改时间".to_string(), format_mtp_datetime(node.modified)),
+                ],
             ),
             Some(node) => (
                 node.name.to_string(),
-                format!(
-                    "{}\n{} 个项目\n\n{}",
-                    node.kind,
-                    node.children.len(),
-                    node.note
+                node.note.clone(),
+                vec![
+                    ("类型".to_string(), node.kind),
+                    ("项目".to_string(), format!("{} 个", node.children.len())),
+                ],
+            ),
+            None => match selected_device.as_ref() {
+                Some((_index, device)) => (
+                    self.device_list_name(device),
+                    String::new(),
+                    vec![
+                        ("状态".to_string(), self.mount_status(device.location_id)),
+                        ("制造商".to_string(), self.device_manufacturer(device)),
+                        (
+                            "序列号".to_string(),
+                            device
+                                .serial_number
+                                .as_deref()
+                                .unwrap_or("未提供")
+                                .to_string(),
+                        ),
+                        ("位置".to_string(), format!("{:08x}", device.location_id)),
+                    ],
                 ),
-            ),
-            None => (
-                "未选择文件".to_string(),
-                "选择 MTP 设备后展开目录".to_string(),
-            ),
+                None => (
+                    "未选择文件".to_string(),
+                    "选择 MTP 设备后展开目录".to_string(),
+                    Vec::new(),
+                ),
+            },
         };
 
         if let Some(label) = self.ivars().title_label.get() {
@@ -762,7 +854,12 @@ impl Delegate {
         }
         if let Some(label) = self.ivars().detail_label.get() {
             label.setStringValue(&NSString::from_str(&detail));
+            label.setHidden(detail.is_empty());
         }
+        self.render_detail_info_rows(rows);
+        self.update_detail_device_controls(
+            selected_device.map(|(index, device)| (index, device.location_id)),
+        );
     }
 
     fn open_quick_look_panel(&self) {
@@ -832,6 +929,23 @@ impl Delegate {
             None => return,
         };
 
+        self.clear_outline_selection();
+
+        if *self.ivars().current_device_location.borrow() == Some(device_info.location_id) {
+            if mount_after_connect {
+                if let Some(device) = self.ivars().device.borrow().clone() {
+                    self.mount_current_device(device, &device_info);
+                } else {
+                    self.ivars()
+                        .pending_mount_location
+                        .replace(Some(device_info.location_id));
+                }
+            }
+            self.update_detail();
+            self.update_mount_controls();
+            return;
+        }
+
         self.close_current_device();
         let mtp_lock = self.mtp_lock_for_device(device_info.location_id);
         self.ivars()
@@ -846,6 +960,8 @@ impl Delegate {
                 .replace(Some(device_info.location_id));
         }
         self.set_browser_message("正在连接设备", &device_info.display());
+        self.update_detail();
+        self.update_mount_controls();
         self.start_device_connect(device_info, mtp_lock);
     }
 
@@ -907,8 +1023,9 @@ impl Delegate {
 
         self.set_message(
             "已连接设备",
-            "可使用内置浏览器浏览文件，或点击设备旁边的挂载按钮挂载到 Finder。",
+            "可使用内置浏览器浏览文件，或使用右侧按钮挂载到系统。",
         );
+        self.update_detail();
     }
 
     fn mount_device_at_index(&self, index: usize) {
@@ -917,11 +1034,11 @@ impl Delegate {
         };
         let location_id = device_info.location_id;
         if *self.ivars().current_mount_location.borrow() == Some(location_id) {
-            self.set_message("已挂载到 Finder", "这个设备已经挂载。");
+            self.set_message("已挂载", "这个设备已经挂载。");
             return;
         }
         if *self.ivars().current_mounting_location.borrow() == Some(location_id) {
-            self.set_message("正在挂载到 Finder", "请等待这个设备的挂载操作完成。");
+            self.set_message("正在挂载", "请等待这个设备的挂载操作完成。");
             return;
         }
         if *self.ivars().current_device_location.borrow() != Some(location_id) {
@@ -940,13 +1057,13 @@ impl Delegate {
             return;
         };
         if *self.ivars().current_mount_location.borrow() != Some(device_info.location_id) {
-            self.set_message("未挂载到 Finder", "这个设备当前没有 Finder 挂载。");
+            self.set_message("未挂载", "这个设备当前没有挂载。");
             return;
         }
         self.eject_current_mount();
         self.ivars().current_mount_location.borrow_mut().take();
         self.update_mount_controls();
-        self.set_message("已推出 Finder 挂载", "内置浏览器仍可继续使用当前设备。");
+        self.set_message("已推出", "内置浏览器仍可继续使用当前设备。");
     }
 
     fn mount_current_device(&self, device: MtpDevice, device_info: &MtpDeviceInfo) {
@@ -955,26 +1072,20 @@ impl Delegate {
         if !mount::macfuse_available() {
             self.set_message(
                 "已连接设备",
-                "未检测到 macFUSE，保留内置浏览器模式。安装 macFUSE 后可挂载到 Finder。",
+                "未检测到 macFUSE，保留内置浏览器模式。安装 macFUSE 后可挂载到系统。",
             );
             self.update_mount_controls();
             return;
         }
 
         let Some(tx) = self.ivars().mount_events_tx.get().cloned() else {
-            self.set_message(
-                "Finder 挂载失败",
-                "挂载事件通道未初始化，仍可使用内置浏览器。",
-            );
+            self.set_message("挂载失败", "挂载事件通道未初始化，仍可使用内置浏览器。");
             return;
         };
         let device_info = device_info.clone();
         let location_id = device_info.location_id;
         let mtp_lock = self.mtp_lock_for_device(location_id);
-        self.set_message(
-            "正在挂载到 Finder",
-            "内置浏览器已可使用，Finder 挂载将在后台完成。",
-        );
+        self.set_message("正在挂载", "内置浏览器已可使用，挂载将在后台完成。");
         self.ivars()
             .current_mounting_location
             .replace(Some(location_id));
@@ -1063,10 +1174,7 @@ impl Delegate {
                 },
                 created: object.created,
                 modified: object.modified,
-                note: format!(
-                    "Handle: {}\nStorage: {}\n选中文件按下空格预览文件。\n选中后拖拽到Finder可复制文件到本机。",
-                    object.handle.0, storage_id.0
-                ),
+                note: "选中文件按下空格预览文件\n选中后拖拽到Finder可复制文件到本机".to_string(),
                 source: NodeSource::Object {
                     storage_id,
                     handle: object.handle,
@@ -1180,7 +1288,7 @@ impl Delegate {
         let path = url
             .path()
             .map(|path| PathBuf::from(path.to_string()))
-            .ok_or_else(|| "Finder 没有提供有效目标路径。".to_string())?;
+            .ok_or_else(|| "Finder没有提供有效目标路径。".to_string())?;
         let job = self
             .export_node(index)
             .ok_or_else(|| "只能拖拽 MTP 文件或文件夹。".to_string())?;
@@ -1512,7 +1620,174 @@ impl Delegate {
     }
 
     fn update_mount_controls(&self) {
+        self.update_detail_device_controls(self.selected_device_index().and_then(|index| {
+            self.ivars()
+                .devices
+                .borrow()
+                .get(index)
+                .map(|device| (index, device.location_id))
+        }));
         self.render_device_rows();
+    }
+
+    fn render_detail_info_rows(&self, rows: Vec<(String, String)>) {
+        let Some(info_view) = self.ivars().detail_info_view.get() else {
+            return;
+        };
+
+        for row in self.ivars().detail_info_rows.borrow_mut().drain(..) {
+            row.removeFromSuperview();
+        }
+
+        if rows.is_empty() {
+            return;
+        }
+
+        let bounds = info_view.bounds();
+        let width = bounds.size.width.max(0.0);
+        let header_height = 24.0;
+        let row_height = 30.0;
+        let mut y = (bounds.size.height - header_height).max(0.0);
+
+        let header = NSTextField::labelWithString(ns_string!("信息"), self.mtm());
+        header.setFrame(NSRect::new(
+            NSPoint::new(0.0, y),
+            NSSize::new(width, header_height),
+        ));
+        header.setFont(Some(&NSFont::boldSystemFontOfSize(14.0)));
+        header.setTextColor(Some(&NSColor::labelColor()));
+        header.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
+        info_view.addSubview(&header);
+        let header_view: Retained<NSView> = header.into_super().into_super();
+        self.ivars().detail_info_rows.borrow_mut().push(header_view);
+
+        y -= row_height;
+        for (label, value) in rows {
+            let row = NSView::new(self.mtm());
+            row.setFrame(NSRect::new(
+                NSPoint::new(0.0, y.max(0.0)),
+                NSSize::new(width, row_height),
+            ));
+            row.setAutoresizingMask(
+                NSAutoresizingMaskOptions::ViewWidthSizable
+                    | NSAutoresizingMaskOptions::ViewMinYMargin,
+            );
+
+            let key_field = NSTextField::labelWithString(&NSString::from_str(&label), self.mtm());
+            key_field.setFrame(NSRect::new(NSPoint::new(0.0, 6.0), NSSize::new(76.0, 18.0)));
+            key_field.setFont(Some(&NSFont::systemFontOfSize(12.0)));
+            key_field.setTextColor(Some(&NSColor::secondaryLabelColor()));
+            key_field.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+
+            let value_field =
+                NSTextField::labelWithString(&NSString::from_str(value.trim()), self.mtm());
+            value_field.setFrame(NSRect::new(
+                NSPoint::new(78.0, 6.0),
+                NSSize::new((width - 78.0).max(0.0), 18.0),
+            ));
+            value_field.setFont(Some(&NSFont::systemFontOfSize(12.0)));
+            value_field.setTextColor(Some(&NSColor::labelColor()));
+            value_field.setLineBreakMode(NSLineBreakMode::ByTruncatingMiddle);
+            value_field.setAlignment(NSTextAlignment::Right);
+            value_field.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
+
+            let separator = NSBox::initWithFrame(
+                NSBox::alloc(self.mtm()),
+                NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, 1.0)),
+            );
+            separator.setBoxType(NSBoxType::Separator);
+            separator.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
+
+            row.addSubview(&separator);
+            row.addSubview(&key_field);
+            row.addSubview(&value_field);
+            info_view.addSubview(&row);
+            self.ivars().detail_info_rows.borrow_mut().push(row);
+
+            y -= row_height;
+            if y < 0.0 {
+                break;
+            }
+        }
+    }
+
+    fn selected_device_index(&self) -> Option<usize> {
+        let location = *self.ivars().current_device_location.borrow();
+        let devices = self.ivars().devices.borrow();
+        location.and_then(|location| {
+            devices
+                .iter()
+                .position(|device| device.location_id == location)
+        })
+    }
+
+    fn clear_outline_selection(&self) {
+        if let Some(outline) = self.ivars().outline_view.get() {
+            unsafe { outline.deselectAll(None) };
+        }
+    }
+
+    fn device_list_name(&self, device: &MtpDeviceInfo) -> String {
+        device
+            .product
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .unwrap_or("MTP 设备")
+            .to_string()
+    }
+
+    fn device_manufacturer(&self, device: &MtpDeviceInfo) -> String {
+        device
+            .manufacturer
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .unwrap_or("未提供")
+            .to_string()
+    }
+
+    fn mount_status(&self, location_id: u64) -> String {
+        if *self.ivars().current_mount_location.borrow() == Some(location_id) {
+            "已挂载到 Finder".to_string()
+        } else if *self.ivars().current_mounting_location.borrow() == Some(location_id) {
+            "正在挂载到 Finder".to_string()
+        } else if *self.ivars().current_device_location.borrow() == Some(location_id) {
+            "已连接，未挂载".to_string()
+        } else {
+            "未连接".to_string()
+        }
+    }
+
+    fn update_detail_device_controls(&self, selected: Option<(usize, u64)>) {
+        let controls_enabled = self.ivars().active_copies.load(Ordering::SeqCst) == 0;
+        let mounted_location = *self.ivars().current_mount_location.borrow();
+        let mounting_location = *self.ivars().current_mounting_location.borrow();
+
+        if let Some(button) = self.ivars().detail_mount_button.get() {
+            let tag = selected
+                .map(|(index, _)| (index + 1) as NSInteger)
+                .unwrap_or(0);
+            button.setTag(tag);
+            button.setEnabled(
+                controls_enabled
+                    && selected.is_some_and(|(_, location_id)| {
+                        mounted_location != Some(location_id)
+                            && mounting_location != Some(location_id)
+                    }),
+            );
+        }
+        if let Some(button) = self.ivars().detail_eject_button.get() {
+            let tag = selected
+                .map(|(index, _)| (index + 1) as NSInteger)
+                .unwrap_or(0);
+            button.setTag(tag);
+            button.setEnabled(
+                controls_enabled
+                    && selected
+                        .is_some_and(|(_, location_id)| mounted_location == Some(location_id)),
+            );
+        }
     }
 
     fn sender_device_index(&self, sender: Option<&AnyObject>) -> Option<usize> {
@@ -1535,12 +1810,11 @@ impl Delegate {
         let bounds = device_list.bounds();
         let list_width = bounds.size.width.max(0.0);
         let list_height = bounds.size.height.max(0.0);
-        let row_height = 36.0;
-        let row_step = 40.0;
+        let row_height = 54.0;
+        let row_step = 58.0;
         let top_y = (list_height - row_height).max(0.0);
-        let eject_x = (list_width - 50.0).max(0.0);
-        let mount_x = (eject_x - 52.0).max(0.0);
-        let title_width = (mount_x - 12.0).max(0.0);
+        let text_x = 40.0;
+        let title_width = (list_width - text_x - 12.0).max(0.0);
 
         let devices = self.ivars().devices.borrow();
         if devices.is_empty() {
@@ -1570,13 +1844,12 @@ impl Delegate {
         }
 
         let current_location = *self.ivars().current_device_location.borrow();
-        let mounted_location = *self.ivars().current_mount_location.borrow();
-        let mounting_location = *self.ivars().current_mounting_location.borrow();
         let controls_enabled = self.ivars().active_copies.load(Ordering::SeqCst) == 0;
 
         for (index, device) in devices.iter().enumerate() {
             let y = (top_y - (index as f64 * row_step)).max(0.0);
-            let row = NSView::new(self.mtm());
+            let device_row = DeviceRowView::new(self.mtm());
+            let row: Retained<NSView> = device_row.clone().into_super();
             row.setFrame(NSRect::new(
                 NSPoint::new(0.0, y),
                 NSSize::new(list_width, row_height),
@@ -1586,15 +1859,74 @@ impl Delegate {
                     | NSAutoresizingMaskOptions::ViewWidthSizable,
             );
 
-            let title = if current_location == Some(device.location_id) {
-                format!("> {}", device.display())
-            } else {
-                device.display()
+            let hover_background = NSBox::initWithFrame(
+                NSBox::alloc(self.mtm()),
+                NSRect::new(
+                    NSPoint::new(0.0, 1.0),
+                    NSSize::new(list_width, row_height - 2.0),
+                ),
+            );
+            hover_background.setBoxType(NSBoxType::Custom);
+            hover_background.setCornerRadius(6.0);
+            hover_background.setTransparent(false);
+            hover_background.setFillColor(&NSColor::separatorColor());
+            hover_background.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
+            row.addSubview(&hover_background);
+            device_row.set_hover_background(hover_background);
+
+            if current_location == Some(device.location_id) {
+                let background = NSBox::initWithFrame(
+                    NSBox::alloc(self.mtm()),
+                    NSRect::new(
+                        NSPoint::new(0.0, 1.0),
+                        NSSize::new(list_width, row_height - 2.0),
+                    ),
+                );
+                background.setBoxType(NSBoxType::Custom);
+                background.setCornerRadius(6.0);
+                background.setTransparent(false);
+                background.setFillColor(&NSColor::unemphasizedSelectedContentBackgroundColor());
+                background.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
+                row.addSubview(&background);
+            }
+
+            let select_button = unsafe {
+                NSButton::buttonWithTitle_target_action(
+                    ns_string!(""),
+                    Some(self),
+                    Some(sel!(selectDevice:)),
+                    self.mtm(),
+                )
             };
+            select_button.setFrame(NSRect::new(
+                NSPoint::new(0.0, 1.0),
+                NSSize::new(list_width, row_height - 2.0),
+            ));
+            select_button.setBordered(false);
+            select_button.setTransparent(true);
+            select_button.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
+            select_button.setTag((index + 1) as NSInteger);
+            select_button.setEnabled(controls_enabled);
+            device_row.install_hover_tracking();
+
+            if let Some(icon) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                ns_string!("externaldrive"),
+                Some(ns_string!("MTP device")),
+            ) {
+                let image_view = NSImageView::imageViewWithImage(&icon, self.mtm());
+                image_view.setFrame(NSRect::new(
+                    NSPoint::new(10.0, 16.0),
+                    NSSize::new(20.0, 20.0),
+                ));
+                image_view.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMaxXMargin);
+                row.addSubview(&image_view);
+            }
+
+            let title = self.device_list_name(device);
             let title_label = NSTextField::labelWithString(&NSString::from_str(&title), self.mtm());
             title_label.setFrame(NSRect::new(
-                NSPoint::new(6.0, 8.0),
-                NSSize::new(title_width, 20.0),
+                NSPoint::new(text_x, 26.0),
+                NSSize::new(title_width, 18.0),
             ));
             title_label.setFont(Some(&NSFont::systemFontOfSize(13.0)));
             title_label.setUsesSingleLineMode(true);
@@ -1607,64 +1939,23 @@ impl Delegate {
             };
             title_label.setTextColor(Some(&title_color));
 
-            let select_button = unsafe {
-                NSButton::buttonWithTitle_target_action(
-                    ns_string!(""),
-                    Some(self),
-                    Some(sel!(selectDevice:)),
-                    self.mtm(),
-                )
-            };
-            select_button.setFrame(NSRect::new(
-                NSPoint::new(0.0, 3.0),
-                NSSize::new((title_width + 12.0).max(0.0), 28.0),
-            ));
-            select_button.setBordered(false);
-            select_button.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
-            select_button.setTag((index + 1) as NSInteger);
-            select_button.setEnabled(controls_enabled);
-
-            let mount_button = unsafe {
-                NSButton::buttonWithTitle_target_action(
-                    ns_string!("挂载"),
-                    Some(self),
-                    Some(sel!(mountDevice:)),
-                    self.mtm(),
-                )
-            };
-            mount_button.setFrame(NSRect::new(
-                NSPoint::new(mount_x, 4.0),
-                NSSize::new(48.0, 26.0),
-            ));
-            mount_button.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinXMargin);
-            mount_button.setTag((index + 1) as NSInteger);
-            mount_button.setEnabled(
-                controls_enabled
-                    && mounted_location != Some(device.location_id)
-                    && mounting_location != Some(device.location_id),
+            let status_label = NSTextField::labelWithString(
+                &NSString::from_str(&self.mount_status(device.location_id)),
+                self.mtm(),
             );
-
-            let eject_button = unsafe {
-                NSButton::buttonWithTitle_target_action(
-                    ns_string!("推出"),
-                    Some(self),
-                    Some(sel!(ejectDevice:)),
-                    self.mtm(),
-                )
-            };
-            eject_button.setFrame(NSRect::new(
-                NSPoint::new(eject_x, 4.0),
-                NSSize::new(48.0, 26.0),
+            status_label.setFrame(NSRect::new(
+                NSPoint::new(text_x, 9.0),
+                NSSize::new(title_width, 16.0),
             ));
-            eject_button.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinXMargin);
-            eject_button.setTag((index + 1) as NSInteger);
-            eject_button
-                .setEnabled(controls_enabled && mounted_location == Some(device.location_id));
+            status_label.setFont(Some(&NSFont::systemFontOfSize(12.0)));
+            status_label.setUsesSingleLineMode(true);
+            status_label.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+            status_label.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
+            status_label.setTextColor(Some(&NSColor::secondaryLabelColor()));
 
             row.addSubview(&title_label);
+            row.addSubview(&status_label);
             row.addSubview(&select_button);
-            row.addSubview(&mount_button);
-            row.addSubview(&eject_button);
             device_list.addSubview(&row);
             self.ivars().device_row_views.borrow_mut().push(row);
         }

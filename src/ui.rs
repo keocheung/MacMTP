@@ -2,10 +2,12 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{DefinedClass, MainThreadOnly, sel};
 use objc2_app_kit::{
-    NSApplication, NSAutoresizingMaskOptions, NSButton, NSColor, NSDragOperation,
-    NSEventModifierFlags, NSFont, NSLineBreakMode, NSMenu, NSMenuItem, NSOutlineView,
-    NSProgressIndicator, NSScrollView, NSTableColumn, NSTableViewGridLineStyle, NSTableViewStyle,
-    NSTextField, NSView,
+    NSApplication, NSAutoresizingMaskOptions, NSButton, NSCellImagePosition, NSColor,
+    NSDragOperation, NSEventModifierFlags, NSFont, NSImage, NSLineBreakMode, NSMenu, NSMenuItem,
+    NSOutlineView, NSProgressIndicator, NSScrollElasticity, NSScrollView, NSSplitView,
+    NSSplitViewDividerStyle, NSTableColumn, NSTableColumnResizingOptions,
+    NSTableViewColumnAutoresizingStyle, NSTableViewGridLineStyle, NSTableViewStyle, NSTextField,
+    NSView,
 };
 use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize, NSString, ns_string};
 
@@ -13,12 +15,26 @@ use crate::app::Delegate;
 use crate::outline::PreviewOutlineView;
 
 pub fn build_browser_ui(delegate: &Delegate, mtm: MainThreadMarker, content: &NSView) {
+    let content_bounds = content.bounds();
+    let split_width = content_bounds.size.width.max(720.0);
+    let split_height = content_bounds.size.height.max(420.0);
+    let split = NSSplitView::new(mtm);
+    split.setFrame(content_bounds);
+    split.setAutoresizingMask(
+        NSAutoresizingMaskOptions::ViewHeightSizable | NSAutoresizingMaskOptions::ViewWidthSizable,
+    );
+    split.setVertical(true);
+    split.setDividerStyle(NSSplitViewDividerStyle::Thin);
+    split.setDelegate(Some(ProtocolObject::from_ref(delegate)));
+
     let sidebar = NSView::new(mtm);
     sidebar.setFrame(NSRect::new(
         NSPoint::new(0.0, 0.0),
-        NSSize::new(240.0, 560.0),
+        NSSize::new(240.0, split_height),
     ));
-    sidebar.setAutoresizingMask(NSAutoresizingMaskOptions::ViewHeightSizable);
+    sidebar.setAutoresizingMask(
+        NSAutoresizingMaskOptions::ViewHeightSizable | NSAutoresizingMaskOptions::ViewWidthSizable,
+    );
 
     let refresh_button = unsafe {
         NSButton::buttonWithTitle_target_action(
@@ -32,7 +48,10 @@ pub fn build_browser_ui(delegate: &Delegate, mtm: MainThreadMarker, content: &NS
         NSPoint::new(12.0, 516.0),
         NSSize::new(216.0, 30.0),
     ));
-    refresh_button.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinYMargin);
+    refresh_button.setAutoresizingMask(
+        NSAutoresizingMaskOptions::ViewMinYMargin | NSAutoresizingMaskOptions::ViewWidthSizable,
+    );
+    apply_button_symbol(&refresh_button, "arrow.clockwise", "刷新");
 
     let sidebar_title = NSTextField::labelWithString(ns_string!("设备"), mtm);
     sidebar_title.setFrame(NSRect::new(
@@ -58,6 +77,7 @@ pub fn build_browser_ui(delegate: &Delegate, mtm: MainThreadMarker, content: &NS
     outline.setUsesAlternatingRowBackgroundColors(true);
     outline.setGridStyleMask(NSTableViewGridLineStyle::GridNone);
     outline.setStyle(NSTableViewStyle::Plain);
+    outline.setColumnAutoresizingStyle(NSTableViewColumnAutoresizingStyle::NoColumnAutoresizing);
     outline.setAllowsMultipleSelection(true);
     outline.setIndentationPerLevel(16.0);
     outline.setIndentationMarkerFollowsCell(true);
@@ -81,37 +101,55 @@ pub fn build_browser_ui(delegate: &Delegate, mtm: MainThreadMarker, content: &NS
     outline.addTableColumn(&modified_column);
     unsafe { outline.setOutlineTableColumn(Some(&name_column)) };
 
+    let browser_panel = NSView::new(mtm);
+    browser_panel.setFrame(NSRect::new(
+        NSPoint::new(240.0, 0.0),
+        NSSize::new((split_width - 480.0).max(240.0), split_height),
+    ));
+    browser_panel.setAutoresizingMask(
+        NSAutoresizingMaskOptions::ViewHeightSizable | NSAutoresizingMaskOptions::ViewWidthSizable,
+    );
+
     let scroll = NSScrollView::new(mtm);
     scroll.setFrame(NSRect::new(
-        NSPoint::new(240.0, 0.0),
-        NSSize::new(400.0, 560.0),
+        NSPoint::new(0.0, 0.0),
+        NSSize::new(420.0, 560.0),
     ));
     scroll.setAutoresizingMask(
-        NSAutoresizingMaskOptions::ViewHeightSizable
-            | NSAutoresizingMaskOptions::ViewWidthSizable
-            | NSAutoresizingMaskOptions::ViewMaxXMargin,
+        NSAutoresizingMaskOptions::ViewHeightSizable | NSAutoresizingMaskOptions::ViewWidthSizable,
     );
     scroll.setHasVerticalScroller(true);
     scroll.setHasHorizontalScroller(true);
+    scroll.setHorizontalScrollElasticity(NSScrollElasticity::None);
+    scroll.setVerticalScrollElasticity(NSScrollElasticity::None);
     scroll.setDocumentView(Some(&outline));
+
+    let detail_panel = NSView::new(mtm);
+    detail_panel.setFrame(NSRect::new(
+        NSPoint::new((split_width - 240.0).max(480.0), 0.0),
+        NSSize::new(240.0, split_height),
+    ));
+    detail_panel.setAutoresizingMask(
+        NSAutoresizingMaskOptions::ViewHeightSizable | NSAutoresizingMaskOptions::ViewWidthSizable,
+    );
 
     let title = NSTextField::labelWithString(ns_string!("未选择文件"), mtm);
     title.setFrame(NSRect::new(
-        NSPoint::new(664.0, 430.0),
-        NSSize::new(212.0, 78.0),
+        NSPoint::new(16.0, 430.0),
+        NSSize::new(208.0, 78.0),
     ));
     title.setFont(Some(&NSFont::boldSystemFontOfSize(18.0)));
     title.setUsesSingleLineMode(false);
     title.setLineBreakMode(NSLineBreakMode::ByWordWrapping);
     title.setMaximumNumberOfLines(3);
     title.setAutoresizingMask(
-        NSAutoresizingMaskOptions::ViewMinXMargin | NSAutoresizingMaskOptions::ViewMinYMargin,
+        NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMinYMargin,
     );
 
     let detail = NSTextField::labelWithString(ns_string!(""), mtm);
     detail.setFrame(NSRect::new(
-        NSPoint::new(666.0, 190.0),
-        NSSize::new(204.0, 218.0),
+        NSPoint::new(16.0, 338.0),
+        NSSize::new(208.0, 76.0),
     ));
     detail.setFont(Some(&NSFont::systemFontOfSize(14.0)));
     detail.setTextColor(Some(&NSColor::secondaryLabelColor()));
@@ -119,15 +157,58 @@ pub fn build_browser_ui(delegate: &Delegate, mtm: MainThreadMarker, content: &NS
     detail.setLineBreakMode(NSLineBreakMode::ByWordWrapping);
     detail.setMaximumNumberOfLines(0);
     detail.setAutoresizingMask(
-        NSAutoresizingMaskOptions::ViewMinXMargin
-            | NSAutoresizingMaskOptions::ViewMinYMargin
-            | NSAutoresizingMaskOptions::ViewHeightSizable,
+        NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMinYMargin,
     );
+
+    let detail_info = NSView::new(mtm);
+    detail_info.setFrame(NSRect::new(
+        NSPoint::new(16.0, 188.0),
+        NSSize::new(208.0, 136.0),
+    ));
+    detail_info.setAutoresizingMask(
+        NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMinYMargin,
+    );
+
+    let mount_button = unsafe {
+        NSButton::buttonWithTitle_target_action(
+            ns_string!("挂载"),
+            Some(delegate),
+            Some(sel!(mountDevice:)),
+            mtm,
+        )
+    };
+    mount_button.setFrame(NSRect::new(
+        NSPoint::new(16.0, 80.0),
+        NSSize::new(208.0, 30.0),
+    ));
+    mount_button.setAutoresizingMask(
+        NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMaxYMargin,
+    );
+    mount_button.setTag(0);
+    apply_button_symbol(&mount_button, "mount", "挂载");
+
+    let eject_button = unsafe {
+        NSButton::buttonWithTitle_target_action(
+            ns_string!("推出"),
+            Some(delegate),
+            Some(sel!(ejectDevice:)),
+            mtm,
+        )
+    };
+    eject_button.setFrame(NSRect::new(
+        NSPoint::new(16.0, 44.0),
+        NSSize::new(208.0, 30.0),
+    ));
+    eject_button.setAutoresizingMask(
+        NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMaxYMargin,
+    );
+    eject_button.setTag(0);
+    apply_button_symbol(&eject_button, "eject", "推出");
 
     let progress = NSProgressIndicator::new(mtm);
     progress.setFrame(NSRect::new(
-        NSPoint::new(666.0, 160.0),
-        NSSize::new(204.0, 18.0),
+        NSPoint::new(16.0, 118.0),
+        NSSize::new(208.0, 18.0),
     ));
     progress.setIndeterminate(false);
     progress.setMinValue(0.0);
@@ -135,23 +216,43 @@ pub fn build_browser_ui(delegate: &Delegate, mtm: MainThreadMarker, content: &NS
     progress.setDoubleValue(0.0);
     progress.setHidden(true);
     progress.setAutoresizingMask(
-        NSAutoresizingMaskOptions::ViewMinXMargin | NSAutoresizingMaskOptions::ViewMinYMargin,
+        NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMinYMargin,
     );
 
     sidebar.addSubview(&refresh_button);
     sidebar.addSubview(&sidebar_title);
     sidebar.addSubview(&device_list);
-    content.addSubview(&sidebar);
-    content.addSubview(&scroll);
-    content.addSubview(&title);
-    content.addSubview(&detail);
-    content.addSubview(&progress);
+    browser_panel.addSubview(&scroll);
+    detail_panel.addSubview(&title);
+    detail_panel.addSubview(&detail);
+    detail_panel.addSubview(&detail_info);
+    detail_panel.addSubview(&mount_button);
+    detail_panel.addSubview(&eject_button);
+    detail_panel.addSubview(&progress);
+    split.addSubview(&sidebar);
+    split.addSubview(&browser_panel);
+    split.addSubview(&detail_panel);
+    split.setPosition_ofDividerAtIndex(240.0, 0);
+    split.setPosition_ofDividerAtIndex((split_width - 240.0).max(480.0), 1);
+    split.adjustSubviews();
+    content.addSubview(&split);
 
     delegate.ivars().outline_view.set(outline).unwrap();
     delegate.ivars().device_list_view.set(device_list).unwrap();
     delegate.ivars().refresh_button.set(refresh_button).unwrap();
+    delegate
+        .ivars()
+        .detail_mount_button
+        .set(mount_button)
+        .unwrap();
+    delegate
+        .ivars()
+        .detail_eject_button
+        .set(eject_button)
+        .unwrap();
     delegate.ivars().title_label.set(title).unwrap();
     delegate.ivars().detail_label.set(detail).unwrap();
+    delegate.ivars().detail_info_view.set(detail_info).unwrap();
     delegate.ivars().progress_indicator.set(progress).unwrap();
 }
 
@@ -167,7 +268,20 @@ fn make_column(
     );
     column.setTitle(&NSString::from_str(title));
     column.setWidth(width);
+    column.setMinWidth(width);
+    column.setResizingMask(NSTableColumnResizingOptions::UserResizingMask);
     column
+}
+
+fn apply_button_symbol(button: &NSButton, symbol_name: &str, accessibility_description: &str) {
+    if let Some(image) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+        &NSString::from_str(symbol_name),
+        Some(&NSString::from_str(accessibility_description)),
+    ) {
+        button.setImage(Some(&image));
+        button.setImagePosition(NSCellImagePosition::ImageLeading);
+        button.setImageHugsTitle(true);
+    }
 }
 
 pub fn install_main_menu(app: &NSApplication, delegate: &Delegate, mtm: MainThreadMarker) {
