@@ -24,7 +24,6 @@ use crate::loc::tr;
 use crate::util::{format_mtp_error, mtp_datetime_to_system_time, sanitize_filename};
 
 const ROOT_INO: u64 = 1;
-const STORAGE_INO_BASE: u64 = 0x4000_0000_0000_0000;
 const OBJECT_INO_BASE: u64 = 0x8000_0000_0000_0000;
 const TTL: Duration = Duration::from_secs(1);
 const BLOCK_SIZE: u32 = 4096;
@@ -61,21 +60,25 @@ pub fn macfuse_available() -> bool {
 pub fn mount_device(
     device: MtpDevice,
     device_info: &MtpDeviceInfo,
+    storage_id: StorageId,
+    storage_name: &str,
     mtp_lock: Arc<Mutex<()>>,
 ) -> Result<MountHandle, String> {
     if !macfuse_available() {
         return Err(tr("macFUSE was not detected, skipping mount."));
     }
 
-    let volume_name = volume_name(device_info);
+    let volume_name = volume_name(device_info, storage_name);
     cleanup_existing_mountpoints(&volume_name);
     let mountpoint = unique_mountpoint(&volume_name)?;
-    let cache_dir =
-        std::env::temp_dir().join(format!("macmtp-fuse-cache-{}", device_info.location_id));
+    let cache_dir = std::env::temp_dir().join(format!(
+        "macmtp-fuse-cache-{}-{}",
+        device_info.location_id, storage_id.0
+    ));
     fs::create_dir_all(&cache_dir)
         .map_err(|err| format!("{}: {err}", tr("Unable to create FUSE cache directory")))?;
 
-    let fs = MtpFuseFs::new(device, mtp_lock, cache_dir.clone());
+    let fs = MtpFuseFs::new(device, storage_id, mtp_lock, cache_dir.clone());
     let options = vec![
         MountOption::RO,
         MountOption::NoDev,
@@ -99,7 +102,7 @@ pub fn mount_device(
     })
 }
 
-fn volume_name(device_info: &MtpDeviceInfo) -> String {
+fn volume_name(device_info: &MtpDeviceInfo, storage_name: &str) -> String {
     let manufacturer = device_info.manufacturer.as_deref().unwrap_or("").trim();
     let product = device_info.product.as_deref().unwrap_or("").trim();
     let device_name = if !product.is_empty()
@@ -119,8 +122,13 @@ fn volume_name(device_info: &MtpDeviceInfo) -> String {
         "MTP Device".to_string()
     };
 
-    let name = sanitize_filename(&device_name);
-    format!("MacMTP - {name}")
+    let device_name = sanitize_filename(&device_name);
+    let storage_name = sanitize_filename(storage_name);
+    if storage_name.is_empty() {
+        format!("MacMTP - {device_name}")
+    } else {
+        format!("MacMTP - {device_name} - {storage_name}")
+    }
 }
 
 fn unique_mountpoint(volume_name: &str) -> Result<PathBuf, String> {
@@ -168,6 +176,7 @@ fn mountpoint_candidates(volume_name: &str) -> impl Iterator<Item = PathBuf> + '
 struct MtpFuseFs {
     state: Mutex<FsState>,
     device: MtpDevice,
+    storage_id: StorageId,
     mtp_lock: Arc<Mutex<()>>,
     cache_dir: PathBuf,
 }
@@ -191,9 +200,6 @@ struct FsEntry {
 #[derive(Clone)]
 enum FsEntryKind {
     Root,
-    Storage {
-        storage_id: StorageId,
-    },
     Object {
         storage_id: StorageId,
         handle: ObjectHandle,
@@ -202,7 +208,12 @@ enum FsEntryKind {
 }
 
 impl MtpFuseFs {
-    fn new(device: MtpDevice, mtp_lock: Arc<Mutex<()>>, cache_dir: PathBuf) -> Self {
+    fn new(
+        device: MtpDevice,
+        storage_id: StorageId,
+        mtp_lock: Arc<Mutex<()>>,
+        cache_dir: PathBuf,
+    ) -> Self {
         let mut entries = HashMap::new();
         entries.insert(
             ROOT_INO,
@@ -222,6 +233,7 @@ impl MtpFuseFs {
                 children: HashMap::new(),
             }),
             device,
+            storage_id,
             mtp_lock,
             cache_dir,
         }
@@ -231,7 +243,6 @@ impl MtpFuseFs {
         let is_dir = matches!(
             entry.kind,
             FsEntryKind::Root
-                | FsEntryKind::Storage { .. }
                 | FsEntryKind::Object {
                     is_folder: true,
                     ..
@@ -284,10 +295,7 @@ impl MtpFuseFs {
             .ok_or(Errno::ENOENT)?;
 
         let entries = match parent_entry.kind {
-            FsEntryKind::Root => self.load_storages(parent)?,
-            FsEntryKind::Storage { storage_id, .. } => {
-                self.load_objects(parent, storage_id, None)?
-            }
+            FsEntryKind::Root => self.load_objects(parent, self.storage_id, None)?,
             FsEntryKind::Object {
                 storage_id,
                 handle,
@@ -303,45 +311,6 @@ impl MtpFuseFs {
         }
         state.children.insert(parent, child_inos.clone());
         Ok(child_inos)
-    }
-
-    fn load_storages(&self, parent: u64) -> Result<Vec<FsEntry>, Errno> {
-        let storages = self.with_mtp_lock(|| {
-            let runtime = Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|_| Errno::EIO)?;
-            runtime
-                .block_on(async { self.device.storages().await })
-                .map_err(|err| {
-                    eprintln!(
-                        "MacMTP FUSE storage listing failed: {}",
-                        format_mtp_error(&err)
-                    );
-                    Errno::EIO
-                })
-        })??;
-
-        let mut names = HashMap::new();
-        Ok(storages
-            .into_iter()
-            .enumerate()
-            .map(|(index, storage)| {
-                let info = storage.info();
-                let name = unique_name(&mut names, sanitize_filename(&info.description));
-                FsEntry {
-                    ino: STORAGE_INO_BASE | index as u64,
-                    parent,
-                    name: OsString::from(name),
-                    kind: FsEntryKind::Storage {
-                        storage_id: storage.id(),
-                    },
-                    size: 0,
-                    created: None,
-                    modified: None,
-                }
-            })
-            .collect())
     }
 
     fn load_objects(

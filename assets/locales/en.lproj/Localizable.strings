@@ -63,6 +63,7 @@
 "Not Mounted" = "Not Mounted";
 "Not Provided" = "Not Provided";
 "Only MTP files or folders can be dragged." = "Only MTP files or folders can be dragged.";
+"Open Finder" = "Open Finder";
 "Prepared {count} file promises. Release the mouse to start copying." = "Prepared {count} file promises. Release the mouse to start copying.";
 "Preparing Preview" = "Preparing Preview";
 "Preview Failed" = "Preview Failed";
@@ -71,6 +72,7 @@
 "Ready to Drag Copy" = "Ready to Drag Copy";
 "Refresh" = "Refresh";
 "Refresh Devices" = "Refresh Devices";
+"Refreshing Storages" = "Refreshing Storages";
 "Select a Device" = "Select a Device";
 "Select a file and press Space to preview it.\nDrag selected items to Finder to copy files to this Mac." = "Select a file and press Space to preview it.\nDrag selected items to Finder to copy files to this Mac.";
 "Select an MTP device from the left device list." = "Select an MTP device from the left device list.";
@@ -81,13 +83,18 @@
 "Storage" = "Storage";
 "Storage ID" = "Storage ID";
 "The MTP device did not return a storage list." = "The MTP device did not return a storage list.";
+"The MTP device did not return a storage list. Unlock the device, allow file access on the phone, choose File Transfer / MTP, then refresh." = "The MTP device did not return a storage list. Unlock the device, allow file access on the phone, choose File Transfer / MTP, then refresh.";
 "The built-in browser can still use the current device." = "The built-in browser can still use the current device.";
 "The built-in browser is available. Mounting will finish in the background." = "The built-in browser is available. Mounting will finish in the background.";
 "The built-in browser remains available." = "The built-in browser remains available.";
 "The device is mounted at {path}. It will be ejected automatically before quitting." = "The device is mounted at {path}. It will be ejected automatically before quitting.";
+"The storage is mounted at {path}. It will be ejected automatically before quitting." = "The storage is mounted at {path}. It will be ejected automatically before quitting.";
 "The left device list scans MTP devices on launch. You can also click Refresh." = "The left device list scans MTP devices on launch. You can also click Refresh.";
 "This device is already mounted." = "This device is already mounted.";
 "This device is not currently mounted." = "This device is not currently mounted.";
+"This storage is already mounted." = "This storage is already mounted.";
+"This storage is not currently mounted." = "This storage is not currently mounted.";
+"Checking the device storage list again." = "Checking the device storage list again.";
 "Unable to create FUSE cache directory" = "Unable to create FUSE cache directory";
 "Unable to create copy runtime" = "Unable to create copy runtime";
 "Unable to create destination directory" = "Unable to create destination directory";
@@ -98,6 +105,8 @@
 "Unable to write the temporary preview file." = "Unable to write the temporary preview file.";
 "Unable to write to the drag pasteboard." = "Unable to write to the drag pasteboard.";
 "Wait for this device's mount operation to finish." = "Wait for this device's mount operation to finish.";
+"Wait for this storage's mount operation to finish." = "Wait for this storage's mount operation to finish.";
+"Unlock the Android device, choose File Transfer / MTP, and allow access if prompted." = "Unlock the Android device, choose File Transfer / MTP, and allow access if prompted.";
 "macFUSE was not detected, skipping mount." = "macFUSE was not detected, skipping mount.";
 "macFUSE was not detected, so built-in browser mode remains active. Install macFUSE to mount devices in the system." = "macFUSE was not detected, so built-in browser mode remains active. Install macFUSE to mount devices in the system.";
 "macOS ptpcamerad or Android File Transfer may be using this device. Quit related apps; if needed, run temporarily: pkill -9 ptpcamerad" = "macOS ptpcamerad or Android File Transfer may be using this device. Quit related apps; if needed, run temporarily: pkill -9 ptpcamerad";

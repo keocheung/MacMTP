@@ -63,6 +63,7 @@
 "Not Mounted" = "未挂载";
 "Not Provided" = "未提供";
 "Only MTP files or folders can be dragged." = "只能拖拽 MTP 文件或文件夹。";
+"Open Finder" = "打开 Finder";
 "Prepared {count} file promises. Release the mouse to start copying." = "已准备 {count} 个文件承诺，松开鼠标后开始复制。";
 "Preparing Preview" = "正在准备预览";
 "Preview Failed" = "预览失败";
@@ -71,6 +72,7 @@
 "Ready to Drag Copy" = "可以拖拽复制";
 "Refresh" = "刷新";
 "Refresh Devices" = "刷新设备";
+"Refreshing Storages" = "正在刷新存储";
 "Select a Device" = "请选择设备";
 "Select a file and press Space to preview it.\nDrag selected items to Finder to copy files to this Mac." = "选中文件按下空格预览文件\n选中后拖拽到 Finder 可复制文件到本机";
 "Select an MTP device from the left device list." = "从左侧设备栏选择一个 MTP 设备。";
@@ -81,13 +83,18 @@
 "Storage" = "存储";
 "Storage ID" = "Storage ID";
 "The MTP device did not return a storage list." = "MTP 设备未返回 storage 列表。";
+"The MTP device did not return a storage list. Unlock the device, allow file access on the phone, choose File Transfer / MTP, then refresh." = "MTP 设备未返回存储列表。请解锁手机，在手机上允许文件访问，选择“文件传输 / MTP”后再刷新。";
 "The built-in browser can still use the current device." = "内置浏览器仍可继续使用当前设备。";
 "The built-in browser is available. Mounting will finish in the background." = "内置浏览器已可使用，挂载将在后台完成。";
 "The built-in browser remains available." = "仍可使用内置浏览器。";
 "The device is mounted at {path}. It will be ejected automatically before quitting." = "设备已挂载到 {path}。退出前会自动推出。";
+"The storage is mounted at {path}. It will be ejected automatically before quitting." = "存储已挂载到 {path}。退出前会自动推出。";
 "The left device list scans MTP devices on launch. You can also click Refresh." = "左侧设备栏会在启动时扫描 MTP 设备，也可以点击刷新。";
 "This device is already mounted." = "这个设备已经挂载。";
 "This device is not currently mounted." = "这个设备当前没有挂载。";
+"This storage is already mounted." = "这个存储已经挂载。";
+"This storage is not currently mounted." = "这个存储当前没有挂载。";
+"Checking the device storage list again." = "正在重新读取设备存储列表。";
 "Unable to create FUSE cache directory" = "无法创建 FUSE 缓存目录";
 "Unable to create copy runtime" = "无法创建复制运行时";
 "Unable to create destination directory" = "无法创建目标目录";
@@ -98,6 +105,8 @@
 "Unable to write the temporary preview file." = "无法写入临时预览文件。";
 "Unable to write to the drag pasteboard." = "无法写入拖拽剪贴板。";
 "Wait for this device's mount operation to finish." = "请等待这个设备的挂载操作完成。";
+"Wait for this storage's mount operation to finish." = "请等待这个存储的挂载操作完成。";
+"Unlock the Android device, choose File Transfer / MTP, and allow access if prompted." = "请解锁 Android 手机，选择“文件传输 / MTP”，并在手机上弹窗时允许访问。";
 "macFUSE was not detected, skipping mount." = "未检测到 macFUSE，跳过挂载。";
 "macFUSE was not detected, so built-in browser mode remains active. Install macFUSE to mount devices in the system." = "未检测到 macFUSE，保留内置浏览器模式。安装 macFUSE 后可挂载到系统。";
 "macOS ptpcamerad or Android File Transfer may be using this device. Quit related apps; if needed, run temporarily: pkill -9 ptpcamerad" = "macOS 的 ptpcamerad 或 Android File Transfer 可能占用了设备。请退出相关程序，必要时临时运行: pkill -9 ptpcamerad";

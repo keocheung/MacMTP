@@ -1,5 +1,5 @@
 use std::cell::{OnceCell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use block2::RcBlock;
 use mtp_rs::mtp::{MtpDevice, MtpDeviceInfo};
+use mtp_rs::ptp::StorageInfo;
 use mtp_rs::{ObjectHandle, OperationCode, StorageId};
 use objc2_quartz as _;
 
@@ -18,12 +19,13 @@ use objc2::runtime::{AnyClass, AnyObject, ProtocolObject};
 use objc2::{AnyThread, DefinedClass, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSAutoresizingMaskOptions,
-    NSBackingStoreType, NSBox, NSBoxType, NSButton, NSColor, NSControlTextEditingDelegate,
-    NSDragOperation, NSDraggingSession, NSEvent, NSFilePromiseProvider,
-    NSFilePromiseProviderDelegate, NSFont, NSImage, NSImageView, NSLineBreakMode, NSOutlineView,
-    NSOutlineViewDataSource, NSOutlineViewDelegate, NSPasteboard, NSPasteboardWriting,
-    NSProgressIndicator, NSSplitView, NSSplitViewDelegate, NSTableColumn, NSTextAlignment,
-    NSTextField, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask, NSWorkspace,
+    NSBackingStoreType, NSBox, NSBoxType, NSButton, NSCellImagePosition, NSColor,
+    NSControlTextEditingDelegate, NSDragOperation, NSDraggingSession, NSEvent,
+    NSFilePromiseProvider, NSFilePromiseProviderDelegate, NSFont, NSImage, NSImageView,
+    NSLineBreakMode, NSOutlineView, NSOutlineViewDataSource, NSOutlineViewDelegate, NSPasteboard,
+    NSPasteboardWriting, NSProgressIndicator, NSSplitView, NSSplitViewDelegate, NSTableColumn,
+    NSTextAlignment, NSTextField, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSWorkspace,
 };
 use objc2_foundation::{
     MainThreadMarker, NSArray, NSError, NSIndexSet, NSInteger, NSNotification, NSNumber, NSObject,
@@ -62,12 +64,13 @@ pub(crate) struct AppDelegateIvars {
     pub(crate) progress_indicator: OnceCell<Retained<NSProgressIndicator>>,
     runtime: OnceCell<Runtime>,
     devices: RefCell<Vec<MtpDeviceInfo>>,
+    device_storages: RefCell<HashMap<u64, Vec<StorageSummary>>>,
     device: RefCell<Option<MtpDevice>>,
     current_device_location: RefCell<Option<u64>>,
-    current_mount: RefCell<Option<MountHandle>>,
-    current_mount_location: RefCell<Option<u64>>,
-    current_mounting_location: RefCell<Option<u64>>,
-    pending_mount_location: RefCell<Option<u64>>,
+    selected_storage: RefCell<Option<StorageKey>>,
+    current_mounts: RefCell<HashMap<StorageKey, MountHandle>>,
+    current_mounting_storages: RefCell<HashSet<StorageKey>>,
+    pending_mount_storage: RefCell<Option<StorageKey>>,
     current_mtp_lock: RefCell<Option<Arc<Mutex<()>>>>,
     device_row_views: RefCell<Vec<Retained<NSView>>>,
     detail_info_rows: RefCell<Vec<Retained<NSView>>>,
@@ -93,6 +96,18 @@ struct ExportNode {
     is_folder: bool,
 }
 
+#[derive(Clone)]
+struct StorageSummary {
+    id: StorageId,
+    info: StorageInfo,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct StorageKey {
+    location_id: u64,
+    storage_id: StorageId,
+}
+
 enum CopyEvent {
     Started,
     Progress {
@@ -108,7 +123,7 @@ enum CopyEvent {
 
 enum MountEvent {
     Finished {
-        location_id: u64,
+        key: StorageKey,
         result: Result<MountHandle, String>,
     },
 }
@@ -116,7 +131,11 @@ enum MountEvent {
 enum DeviceEvent {
     Connected {
         device_info: MtpDeviceInfo,
-        result: Result<(MtpDevice, Vec<BrowserNode>, Vec<usize>), String>,
+        result: Result<(MtpDevice, Vec<BrowserNode>, Vec<usize>, Vec<StorageSummary>), String>,
+    },
+    StoragesRefreshed {
+        location_id: u64,
+        result: Result<(Vec<BrowserNode>, Vec<usize>, Vec<StorageSummary>), String>,
     },
 }
 
@@ -453,10 +472,10 @@ define_class!(
             if self.reject_mtp_while_copying(&tr("Files are copying. Devices cannot be mounted right now.")) {
                 return;
             }
-            let Some(index) = self.sender_device_index(sender) else {
+            if self.open_selected_mount_in_finder() {
                 return;
-            };
-            self.mount_device_at_index(index);
+            }
+            self.mount_selected_storage(sender);
         }
 
         #[unsafe(method(ejectDevice:))]
@@ -464,10 +483,18 @@ define_class!(
             if self.reject_mtp_while_copying(&tr("Files are copying. Devices cannot be ejected right now.")) {
                 return;
             }
-            let Some(index) = self.sender_device_index(sender) else {
+            self.eject_selected_storage(sender);
+        }
+
+        #[unsafe(method(selectStorage:))]
+        fn select_storage_action(&self, sender: Option<&AnyObject>) {
+            if self.reject_mtp_while_copying(&tr("Files are copying. Devices cannot be switched right now.")) {
+                return;
+            }
+            let Some((device_index, storage_index)) = self.sender_storage_index(sender) else {
                 return;
             };
-            self.eject_device_at_index(index);
+            self.select_storage_at_index(device_index, storage_index);
         }
 
         #[unsafe(method(drainCopyEvents:))]
@@ -618,11 +645,16 @@ impl Delegate {
         self.set_message(title, detail);
     }
 
+    fn clear_browser_roots(&self) {
+        self.ivars().root_children.borrow_mut().clear();
+        self.reload_outline();
+    }
+
     fn close_current_device(&self) {
-        self.eject_current_mount();
-        self.ivars().current_mount_location.borrow_mut().take();
-        self.ivars().current_mounting_location.borrow_mut().take();
-        self.ivars().pending_mount_location.borrow_mut().take();
+        self.eject_all_mounts();
+        self.ivars().current_mounting_storages.borrow_mut().clear();
+        self.ivars().pending_mount_storage.borrow_mut().take();
+        self.ivars().selected_storage.borrow_mut().take();
         let device = self.ivars().device.borrow_mut().take();
         let mtp_lock = self.ivars().current_mtp_lock.borrow_mut().take();
         self.ivars().current_device_location.borrow_mut().take();
@@ -639,14 +671,46 @@ impl Delegate {
         self.update_mount_controls();
     }
 
-    fn eject_current_mount(&self) {
-        let Some(mount) = self.ivars().current_mount.borrow_mut().take() else {
-            return;
+    fn eject_mount(&self, key: StorageKey) -> bool {
+        let Some(mount) = self.ivars().current_mounts.borrow_mut().remove(&key) else {
+            return false;
         };
         let path = mount.mountpoint().to_string_lossy().to_string();
         let workspace = NSWorkspace::sharedWorkspace();
         let _ = workspace.unmountAndEjectDeviceAtPath(&NSString::from_str(&path));
         drop(mount);
+        true
+    }
+
+    fn eject_all_mounts(&self) {
+        let keys = self
+            .ivars()
+            .current_mounts
+            .borrow()
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        for key in keys {
+            self.eject_mount(key);
+        }
+    }
+
+    fn open_selected_mount_in_finder(&self) -> bool {
+        let Some(key) = *self.ivars().selected_storage.borrow() else {
+            return false;
+        };
+        let Some(path) = self
+            .ivars()
+            .current_mounts
+            .borrow()
+            .get(&key)
+            .map(|mount| mount.mountpoint().to_path_buf())
+        else {
+            return false;
+        };
+        let ns_path = NSString::from_str(&path.to_string_lossy());
+        let url = NSURL::fileURLWithPath(&ns_path);
+        NSWorkspace::sharedWorkspace().openURL(&url)
     }
 
     fn item_index(&self, item: Option<&AnyObject>) -> Option<usize> {
@@ -789,6 +853,11 @@ impl Delegate {
     }
 
     fn update_detail(&self) {
+        let selected_storage = self
+            .ivars()
+            .selected_storage
+            .borrow()
+            .and_then(|key| self.storage_for_key(key).map(|storage| (key, storage)));
         let selected_device = self.selected_device_index().and_then(|index| {
             self.ivars()
                 .devices
@@ -831,29 +900,53 @@ impl Delegate {
                     ),
                 ],
             ),
-            None => match selected_device.as_ref() {
-                Some((_index, device)) => (
-                    self.device_list_name(device),
+            None => match selected_storage.as_ref() {
+                Some((key, storage)) => (
+                    self.storage_name(*key).unwrap_or_else(|| tr("Storage")),
                     String::new(),
                     vec![
-                        (tr("Status"), self.mount_status(device.location_id)),
-                        (tr("Manufacturer"), self.device_manufacturer(device)),
+                        (tr("Status"), self.mount_status(*key)),
+                        (tr("Storage ID"), storage.id.0.to_string()),
                         (
-                            tr("Serial Number"),
-                            device
-                                .serial_number
-                                .as_deref()
-                                .unwrap_or(&tr("Not Provided"))
-                                .to_string(),
+                            tr("Free Space"),
+                            format_bytes(storage.info.free_space_bytes),
                         ),
-                        (tr("Location"), format!("{:08x}", device.location_id)),
+                        (tr("Size"), format_bytes(storage.info.max_capacity)),
                     ],
                 ),
-                None => (
-                    tr("No File Selected"),
-                    tr("Select an MTP device, then expand a directory."),
-                    Vec::new(),
-                ),
+                None => match selected_device.as_ref() {
+                    Some((_index, device)) => (
+                        self.device_list_name(device),
+                        String::new(),
+                        vec![
+                            (
+                                tr("Status"),
+                                if *self.ivars().current_device_location.borrow()
+                                    == Some(device.location_id)
+                                {
+                                    tr("Device Connected")
+                                } else {
+                                    tr("Not Connected")
+                                },
+                            ),
+                            (tr("Manufacturer"), self.device_manufacturer(device)),
+                            (
+                                tr("Serial Number"),
+                                device
+                                    .serial_number
+                                    .as_deref()
+                                    .unwrap_or(&tr("Not Provided"))
+                                    .to_string(),
+                            ),
+                            (tr("Location"), format!("{:08x}", device.location_id)),
+                        ],
+                    ),
+                    None => (
+                        tr("No File Selected"),
+                        tr("Select an MTP device, then expand a directory."),
+                        Vec::new(),
+                    ),
+                },
             },
         };
 
@@ -865,9 +958,7 @@ impl Delegate {
             label.setHidden(detail.is_empty());
         }
         self.render_detail_info_rows(rows);
-        self.update_detail_device_controls(
-            selected_device.map(|(index, device)| (index, device.location_id)),
-        );
+        self.update_detail_device_controls(selected_storage.map(|(key, _)| key));
     }
 
     fn open_quick_look_panel(&self) {
@@ -903,6 +994,7 @@ impl Delegate {
             }
             Ok(found) if found.is_empty() => {
                 self.ivars().devices.borrow_mut().clear();
+                self.ivars().device_storages.borrow_mut().clear();
                 if current_location.is_some() {
                     self.close_current_device();
                     self.clear_browser_state();
@@ -922,6 +1014,12 @@ impl Delegate {
                         self.clear_browser_state();
                     }
                 }
+                self.ivars()
+                    .device_storages
+                    .borrow_mut()
+                    .retain(|location, _| {
+                        found.iter().any(|device| device.location_id == *location)
+                    });
                 *self.ivars().devices.borrow_mut() = found;
                 if current_location.is_none() {
                     self.set_message(
@@ -929,6 +1027,7 @@ impl Delegate {
                         &tr("Select an MTP device from the left device list."),
                     );
                 }
+                self.refresh_current_storages();
             }
         }
         self.update_mount_controls();
@@ -941,16 +1040,14 @@ impl Delegate {
         };
 
         self.clear_outline_selection();
+        self.ivars().selected_storage.borrow_mut().take();
+        self.clear_browser_roots();
 
         if *self.ivars().current_device_location.borrow() == Some(device_info.location_id) {
             if mount_after_connect {
-                if let Some(device) = self.ivars().device.borrow().clone() {
-                    self.mount_current_device(device, &device_info);
-                } else {
-                    self.ivars()
-                        .pending_mount_location
-                        .replace(Some(device_info.location_id));
-                }
+                self.mount_first_storage_for_device(index);
+            } else {
+                self.refresh_current_storages();
             }
             self.update_detail();
             self.update_mount_controls();
@@ -966,14 +1063,39 @@ impl Delegate {
             .current_mtp_lock
             .replace(Some(mtp_lock.clone()));
         if mount_after_connect {
-            self.ivars()
-                .pending_mount_location
-                .replace(Some(device_info.location_id));
+            self.ivars().pending_mount_storage.borrow_mut().take();
         }
-        self.set_browser_message(&tr("Connecting Device"), &device_info.display());
+        self.set_browser_message(
+            &tr("Connecting Device"),
+            &tr("Unlock the Android device, choose File Transfer / MTP, and allow access if prompted."),
+        );
         self.update_detail();
         self.update_mount_controls();
         self.start_device_connect(device_info, mtp_lock);
+    }
+
+    fn refresh_current_storages(&self) {
+        let Some(location_id) = *self.ivars().current_device_location.borrow() else {
+            return;
+        };
+        let Some(device) = self.ivars().device.borrow().clone() else {
+            return;
+        };
+        let Some(tx) = self.ivars().device_events_tx.get().cloned() else {
+            return;
+        };
+        let mtp_lock = self.mtp_lock_for_device(location_id);
+        self.set_message(
+            &tr("Refreshing Storages"),
+            &tr("Checking the device storage list again."),
+        );
+        thread::spawn(move || {
+            let result = run_storage_refresh_worker(device, mtp_lock);
+            let _ = tx.send(DeviceEvent::StoragesRefreshed {
+                location_id,
+                result,
+            });
+        });
     }
 
     fn start_device_connect(&self, device_info: MtpDeviceInfo, mtp_lock: Arc<Mutex<()>>) {
@@ -1000,6 +1122,7 @@ impl Delegate {
         device: MtpDevice,
         nodes: Vec<BrowserNode>,
         roots: Vec<usize>,
+        storages: Vec<StorageSummary>,
     ) {
         if *self.ivars().current_device_location.borrow() != Some(device_info.location_id) {
             let mtp_lock = self.mtp_lock_for_device(device_info.location_id);
@@ -1014,24 +1137,20 @@ impl Delegate {
             return;
         }
 
-        let should_mount =
-            *self.ivars().pending_mount_location.borrow() == Some(device_info.location_id);
-        let device_for_mount = if should_mount {
-            Some(device.clone())
-        } else {
-            None
-        };
-
+        let pending_mount = *self.ivars().pending_mount_storage.borrow();
+        self.ivars()
+            .device_storages
+            .borrow_mut()
+            .insert(device_info.location_id, storages);
         self.ivars().device.replace(Some(device));
         *self.ivars().nodes.borrow_mut() = nodes;
-        *self.ivars().root_children.borrow_mut() = roots;
-        self.reload_outline();
+        self.apply_selected_storage_root(&roots);
         self.update_detail();
         self.update_mount_controls();
 
-        if let Some(device_for_mount) = device_for_mount {
-            self.ivars().pending_mount_location.borrow_mut().take();
-            self.mount_current_device(device_for_mount, &device_info);
+        if let Some(key) = pending_mount.filter(|key| key.location_id == device_info.location_id) {
+            self.ivars().pending_mount_storage.borrow_mut().take();
+            self.mount_storage_key(key);
             return;
         }
 
@@ -1042,49 +1161,160 @@ impl Delegate {
         self.update_detail();
     }
 
-    fn mount_device_at_index(&self, index: usize) {
+    fn apply_refreshed_storages(
+        &self,
+        location_id: u64,
+        nodes: Vec<BrowserNode>,
+        roots: Vec<usize>,
+        storages: Vec<StorageSummary>,
+    ) {
+        if *self.ivars().current_device_location.borrow() != Some(location_id) {
+            return;
+        }
+        self.ivars()
+            .device_storages
+            .borrow_mut()
+            .insert(location_id, storages);
+        *self.ivars().nodes.borrow_mut() = nodes;
+        self.apply_selected_storage_root(&roots);
+        self.update_detail();
+        self.update_mount_controls();
+    }
+
+    fn apply_selected_storage_root(&self, _fallback_roots: &[usize]) {
+        let selected = *self.ivars().selected_storage.borrow();
+        let root = selected.and_then(|key| self.storage_node_index(key));
+        if selected.is_some() && root.is_none() {
+            self.ivars().selected_storage.borrow_mut().take();
+        }
+        *self.ivars().root_children.borrow_mut() =
+            root.map(|index| vec![index]).unwrap_or_default();
+        self.reload_outline();
+    }
+
+    fn select_storage_at_index(&self, device_index: usize, storage_index: usize) {
+        let Some(device_info) = self.ivars().devices.borrow().get(device_index).cloned() else {
+            return;
+        };
+        let storage = self
+            .ivars()
+            .device_storages
+            .borrow()
+            .get(&device_info.location_id)
+            .and_then(|storages| storages.get(storage_index))
+            .cloned();
+        let Some(storage) = storage else {
+            self.select_device_at_index(device_index, false);
+            return;
+        };
+        self.ivars().selected_storage.replace(Some(StorageKey {
+            location_id: device_info.location_id,
+            storage_id: storage.id,
+        }));
+        if *self.ivars().current_device_location.borrow() != Some(device_info.location_id) {
+            self.select_device_at_index(device_index, false);
+        }
+        self.clear_outline_selection();
+        let roots = self.ivars().root_children.borrow().clone();
+        self.apply_selected_storage_root(&roots);
+        self.update_detail();
+        self.update_mount_controls();
+    }
+
+    fn mount_selected_storage(&self, sender: Option<&AnyObject>) {
+        if let Some((device_index, storage_index)) = self.sender_storage_index(sender) {
+            self.select_storage_at_index(device_index, storage_index);
+        }
+        if let Some(key) = *self.ivars().selected_storage.borrow() {
+            self.mount_storage_key(key);
+            return;
+        }
+        if let Some(index) = self
+            .sender_device_index(sender)
+            .or_else(|| self.selected_device_index())
+        {
+            self.mount_first_storage_for_device(index);
+        }
+    }
+
+    fn mount_first_storage_for_device(&self, index: usize) {
         let Some(device_info) = self.ivars().devices.borrow().get(index).cloned() else {
             return;
         };
-        let location_id = device_info.location_id;
-        if *self.ivars().current_mount_location.borrow() == Some(location_id) {
+        let storage_id = self
+            .ivars()
+            .device_storages
+            .borrow()
+            .get(&device_info.location_id)
+            .and_then(|storages| storages.first())
+            .map(|storage| storage.id);
+        if let Some(storage_id) = storage_id {
+            let key = StorageKey {
+                location_id: device_info.location_id,
+                storage_id,
+            };
+            self.ivars().selected_storage.replace(Some(key));
+            self.mount_storage_key(key);
+            return;
+        }
+        self.ivars().pending_mount_storage.borrow_mut().take();
+        self.select_device_at_index(index, false);
+    }
+
+    fn mount_storage_key(&self, key: StorageKey) {
+        let Some(device_info) = self.device_info_for_location(key.location_id) else {
+            return;
+        };
+        if self.ivars().current_mounts.borrow().contains_key(&key) {
             self.set_message(
                 &tr("Already Mounted"),
-                &tr("This device is already mounted."),
+                &tr("This storage is already mounted."),
             );
             return;
         }
-        if *self.ivars().current_mounting_location.borrow() == Some(location_id) {
+        if self
+            .ivars()
+            .current_mounting_storages
+            .borrow()
+            .contains(&key)
+        {
             self.set_message(
                 &tr("Mounting"),
-                &tr("Wait for this device's mount operation to finish."),
+                &tr("Wait for this storage's mount operation to finish."),
             );
             return;
         }
-        if *self.ivars().current_device_location.borrow() != Some(location_id) {
-            self.select_device_at_index(index, true);
+        if *self.ivars().current_device_location.borrow() != Some(key.location_id) {
+            self.ivars().pending_mount_storage.replace(Some(key));
+            if let Some(index) = self.device_index_for_location(key.location_id) {
+                self.select_device_at_index(index, false);
+            }
             return;
         }
         let Some(device) = self.ivars().device.borrow().clone() else {
-            self.select_device_at_index(index, true);
+            self.ivars().pending_mount_storage.replace(Some(key));
+            if let Some(index) = self.device_index_for_location(key.location_id) {
+                self.select_device_at_index(index, false);
+            }
             return;
         };
-        self.mount_current_device(device, &device_info);
+        self.mount_current_storage(device, &device_info, key);
     }
 
-    fn eject_device_at_index(&self, index: usize) {
-        let Some(device_info) = self.ivars().devices.borrow().get(index).cloned() else {
+    fn eject_selected_storage(&self, sender: Option<&AnyObject>) {
+        if let Some((device_index, storage_index)) = self.sender_storage_index(sender) {
+            self.select_storage_at_index(device_index, storage_index);
+        }
+        let Some(key) = *self.ivars().selected_storage.borrow() else {
             return;
         };
-        if *self.ivars().current_mount_location.borrow() != Some(device_info.location_id) {
+        if !self.eject_mount(key) {
             self.set_message(
                 &tr("Not Mounted"),
-                &tr("This device is not currently mounted."),
+                &tr("This storage is not currently mounted."),
             );
             return;
         }
-        self.eject_current_mount();
-        self.ivars().current_mount_location.borrow_mut().take();
         self.update_mount_controls();
         self.set_message(
             &tr("Ejected"),
@@ -1092,9 +1322,12 @@ impl Delegate {
         );
     }
 
-    fn mount_current_device(&self, device: MtpDevice, device_info: &MtpDeviceInfo) {
-        self.eject_current_mount();
-        self.ivars().current_mount_location.borrow_mut().take();
+    fn mount_current_storage(
+        &self,
+        device: MtpDevice,
+        device_info: &MtpDeviceInfo,
+        key: StorageKey,
+    ) {
         if !mount::macfuse_available() {
             self.set_message(
                 &tr("Device Connected"),
@@ -1112,22 +1345,28 @@ impl Delegate {
             return;
         };
         let device_info = device_info.clone();
-        let location_id = device_info.location_id;
-        let mtp_lock = self.mtp_lock_for_device(location_id);
+        let Some(storage_name) = self.storage_name(key) else {
+            return;
+        };
+        let mtp_lock = self.mtp_lock_for_device(key.location_id);
         self.set_message(
             &tr("Mounting"),
             &tr("The built-in browser is available. Mounting will finish in the background."),
         );
         self.ivars()
-            .current_mounting_location
-            .replace(Some(location_id));
+            .current_mounting_storages
+            .borrow_mut()
+            .insert(key);
         self.update_mount_controls();
         thread::spawn(move || {
-            let result = mount::mount_device(device, &device_info, mtp_lock);
-            let _ = tx.send(MountEvent::Finished {
-                location_id,
-                result,
-            });
+            let result = mount::mount_device(
+                device,
+                &device_info,
+                key.storage_id,
+                &storage_name,
+                mtp_lock,
+            );
+            let _ = tx.send(MountEvent::Finished { key, result });
         });
     }
 
@@ -1523,7 +1762,8 @@ impl Delegate {
     }
 
     fn drain_device_events(&self) {
-        let mut last_result = None;
+        let mut last_connected = None;
+        let mut last_refresh = None;
         if let Some(rx) = self.ivars().device_events_rx.borrow_mut().as_mut() {
             while let Ok(event) = rx.try_recv() {
                 match event {
@@ -1531,13 +1771,32 @@ impl Delegate {
                         device_info,
                         result,
                     } => {
-                        last_result = Some((device_info, result));
+                        last_connected = Some((device_info, result));
+                    }
+                    DeviceEvent::StoragesRefreshed {
+                        location_id,
+                        result,
+                    } => {
+                        last_refresh = Some((location_id, result));
                     }
                 }
             }
         }
 
-        let Some((device_info, result)) = last_result else {
+        if let Some((location_id, result)) = last_refresh {
+            if *self.ivars().current_device_location.borrow() == Some(location_id) {
+                match result {
+                    Ok((nodes, roots, storages)) => {
+                        self.apply_refreshed_storages(location_id, nodes, roots, storages);
+                    }
+                    Err(message) => {
+                        self.set_message(&tr("Device Scan Failed"), &message);
+                    }
+                }
+            }
+        }
+
+        let Some((device_info, result)) = last_connected else {
             return;
         };
         if *self.ivars().current_device_location.borrow() != Some(device_info.location_id) {
@@ -1545,8 +1804,8 @@ impl Delegate {
         }
 
         match result {
-            Ok((device, nodes, roots)) => {
-                self.apply_connected_device(device_info, device, nodes, roots);
+            Ok((device, nodes, roots, storages)) => {
+                self.apply_connected_device(device_info, device, nodes, roots, storages);
             }
             Err(message) => {
                 self.ivars().device.borrow_mut().take();
@@ -1563,42 +1822,40 @@ impl Delegate {
         if let Some(rx) = self.ivars().mount_events_rx.borrow_mut().as_mut() {
             while let Ok(event) = rx.try_recv() {
                 match event {
-                    MountEvent::Finished {
-                        location_id,
-                        result,
-                    } => {
-                        last_result = Some((location_id, result));
+                    MountEvent::Finished { key, result } => {
+                        last_result = Some((key, result));
                     }
                 }
             }
         }
 
-        let Some((location_id, result)) = last_result else {
+        let Some((key, result)) = last_result else {
             return;
         };
-        if *self.ivars().current_device_location.borrow() != Some(location_id) {
+        if *self.ivars().current_device_location.borrow() != Some(key.location_id) {
             if let Ok(handle) = result {
                 drop(handle);
             }
-            if *self.ivars().current_mounting_location.borrow() == Some(location_id) {
-                self.ivars().current_mounting_location.borrow_mut().take();
-                self.update_mount_controls();
-            }
+            self.ivars()
+                .current_mounting_storages
+                .borrow_mut()
+                .remove(&key);
+            self.update_mount_controls();
             return;
         }
-        self.ivars().current_mounting_location.borrow_mut().take();
+        self.ivars()
+            .current_mounting_storages
+            .borrow_mut()
+            .remove(&key);
 
         match result {
             Ok(handle) => {
                 let path = handle.mountpoint().display().to_string();
-                self.ivars().current_mount.replace(Some(handle));
-                self.ivars()
-                    .current_mount_location
-                    .replace(Some(location_id));
+                self.ivars().current_mounts.borrow_mut().insert(key, handle);
                 self.update_mount_controls();
                 self.set_message(
                     &tr("Mounted in Finder"),
-                    &tr("The device is mounted at {path}. It will be ejected automatically before quitting.")
+                    &tr("The storage is mounted at {path}. It will be ejected automatically before quitting.")
                         .replace("{path}", &path),
                 );
             }
@@ -1681,13 +1938,7 @@ impl Delegate {
     }
 
     fn update_mount_controls(&self) {
-        self.update_detail_device_controls(self.selected_device_index().and_then(|index| {
-            self.ivars()
-                .devices
-                .borrow()
-                .get(index)
-                .map(|device| (index, device.location_id))
-        }));
+        self.update_detail_device_controls(*self.ivars().selected_storage.borrow());
         self.render_device_rows();
     }
 
@@ -1782,6 +2033,63 @@ impl Delegate {
         })
     }
 
+    fn device_index_for_location(&self, location_id: u64) -> Option<usize> {
+        self.ivars()
+            .devices
+            .borrow()
+            .iter()
+            .position(|device| device.location_id == location_id)
+    }
+
+    fn device_info_for_location(&self, location_id: u64) -> Option<MtpDeviceInfo> {
+        self.ivars()
+            .devices
+            .borrow()
+            .iter()
+            .find(|device| device.location_id == location_id)
+            .cloned()
+    }
+
+    fn storage_for_key(&self, key: StorageKey) -> Option<StorageSummary> {
+        self.ivars()
+            .device_storages
+            .borrow()
+            .get(&key.location_id)?
+            .iter()
+            .find(|storage| storage.id == key.storage_id)
+            .cloned()
+    }
+
+    fn storage_node_index(&self, key: StorageKey) -> Option<usize> {
+        if *self.ivars().current_device_location.borrow() != Some(key.location_id) {
+            return None;
+        }
+        self.ivars()
+            .nodes
+            .borrow()
+            .iter()
+            .position(|node| matches!(node.source, NodeSource::Storage { storage_id } if storage_id == key.storage_id))
+    }
+
+    fn storage_name(&self, key: StorageKey) -> Option<String> {
+        let storage = self.storage_for_key(key)?;
+        let description = storage.info.description.trim();
+        if description.is_empty() {
+            Some(format!("{} {}", tr("Storage"), storage.id.0))
+        } else {
+            Some(description.to_string())
+        }
+    }
+
+    fn storage_used_percent(storage: &StorageSummary) -> f64 {
+        let capacity = storage.info.max_capacity;
+        if capacity == 0 {
+            return 0.0;
+        }
+        let used = capacity.saturating_sub(storage.info.free_space_bytes);
+        ((used as f64 / capacity as f64) * 100.0).clamp(0.0, 100.0)
+    }
+
     fn clear_outline_selection(&self) {
         if let Some(outline) = self.ivars().outline_view.get() {
             unsafe { outline.deselectAll(None) };
@@ -1808,46 +2116,66 @@ impl Delegate {
             .to_string()
     }
 
-    fn mount_status(&self, location_id: u64) -> String {
-        if *self.ivars().current_mount_location.borrow() == Some(location_id) {
+    fn mount_status(&self, key: StorageKey) -> String {
+        if self.ivars().current_mounts.borrow().contains_key(&key) {
             tr("Mounted in Finder")
-        } else if *self.ivars().current_mounting_location.borrow() == Some(location_id) {
+        } else if self
+            .ivars()
+            .current_mounting_storages
+            .borrow()
+            .contains(&key)
+        {
             tr("Mounting in Finder")
-        } else if *self.ivars().current_device_location.borrow() == Some(location_id) {
+        } else if *self.ivars().current_device_location.borrow() == Some(key.location_id) {
             tr("Connected, Not Mounted")
         } else {
             tr("Not Connected")
         }
     }
 
-    fn update_detail_device_controls(&self, selected: Option<(usize, u64)>) {
+    fn update_detail_device_controls(&self, selected: Option<StorageKey>) {
         let controls_enabled = self.ivars().active_copies.load(Ordering::SeqCst) == 0;
-        let mounted_location = *self.ivars().current_mount_location.borrow();
-        let mounting_location = *self.ivars().current_mounting_location.borrow();
 
         if let Some(button) = self.ivars().detail_mount_button.get() {
-            let tag = selected
-                .map(|(index, _)| (index + 1) as NSInteger)
-                .unwrap_or(0);
-            button.setTag(tag);
+            button.setTag(0);
+            let is_mounted =
+                selected.is_some_and(|key| self.ivars().current_mounts.borrow().contains_key(&key));
+            if is_mounted {
+                self.configure_button(button, &tr("Open Finder"), "folder");
+            } else {
+                self.configure_button(button, &tr("Mount"), "mount");
+            }
             button.setEnabled(
                 controls_enabled
-                    && selected.is_some_and(|(_, location_id)| {
-                        mounted_location != Some(location_id)
-                            && mounting_location != Some(location_id)
+                    && selected.is_some_and(|key| {
+                        self.ivars().current_mounts.borrow().contains_key(&key)
+                            || !self
+                                .ivars()
+                                .current_mounting_storages
+                                .borrow()
+                                .contains(&key)
                     }),
             );
         }
         if let Some(button) = self.ivars().detail_eject_button.get() {
-            let tag = selected
-                .map(|(index, _)| (index + 1) as NSInteger)
-                .unwrap_or(0);
-            button.setTag(tag);
+            button.setTag(0);
             button.setEnabled(
                 controls_enabled
                     && selected
-                        .is_some_and(|(_, location_id)| mounted_location == Some(location_id)),
+                        .is_some_and(|key| self.ivars().current_mounts.borrow().contains_key(&key)),
             );
+        }
+    }
+
+    fn configure_button(&self, button: &NSButton, title: &str, symbol_name: &str) {
+        button.setTitle(&NSString::from_str(title));
+        if let Some(image) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+            &NSString::from_str(symbol_name),
+            Some(&NSString::from_str(title)),
+        ) {
+            button.setImage(Some(&image));
+            button.setImagePosition(NSCellImagePosition::ImageLeading);
+            button.setImageHugsTitle(true);
         }
     }
 
@@ -1857,6 +2185,19 @@ impl Delegate {
             return None;
         }
         Some((tag - 1) as usize)
+    }
+
+    fn sender_storage_index(&self, sender: Option<&AnyObject>) -> Option<(usize, usize)> {
+        let tag = sender?.downcast_ref::<NSButton>()?.tag();
+        if tag < 10_000 {
+            return None;
+        }
+        let encoded = tag - 10_000;
+        Some(((encoded / 1_000) as usize, (encoded % 1_000) as usize))
+    }
+
+    fn storage_button_tag(device_index: usize, storage_index: usize) -> NSInteger {
+        10_000 + (device_index as NSInteger * 1_000) + storage_index as NSInteger
     }
 
     fn render_device_rows(&self) {
@@ -1872,7 +2213,8 @@ impl Delegate {
         let list_width = bounds.size.width.max(0.0);
         let list_height = bounds.size.height.max(0.0);
         let row_height = 54.0;
-        let row_step = 58.0;
+        let storage_row_height = 58.0;
+        let row_gap = 4.0;
         let top_y = (list_height - row_height).max(0.0);
         let text_x = 40.0;
         let title_width = (list_width - text_x - 12.0).max(0.0);
@@ -1905,10 +2247,11 @@ impl Delegate {
         }
 
         let current_location = *self.ivars().current_device_location.borrow();
+        let selected_storage = *self.ivars().selected_storage.borrow();
         let controls_enabled = self.ivars().active_copies.load(Ordering::SeqCst) == 0;
+        let mut y = top_y;
 
         for (index, device) in devices.iter().enumerate() {
-            let y = (top_y - (index as f64 * row_step)).max(0.0);
             let device_row = DeviceRowView::new(self.mtm());
             let row: Retained<NSView> = device_row.clone().into_super();
             row.setFrame(NSRect::new(
@@ -1971,7 +2314,7 @@ impl Delegate {
             device_row.install_hover_tracking();
 
             if let Some(icon) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
-                ns_string!("externaldrive"),
+                ns_string!("smartphone"),
                 Some(&ns_tr("MTP device")),
             ) {
                 let image_view = NSImageView::imageViewWithImage(&icon, self.mtm());
@@ -2000,10 +2343,13 @@ impl Delegate {
             };
             title_label.setTextColor(Some(&title_color));
 
-            let status_label = NSTextField::labelWithString(
-                &NSString::from_str(&self.mount_status(device.location_id)),
-                self.mtm(),
-            );
+            let device_status = if current_location == Some(device.location_id) {
+                tr("Device Connected")
+            } else {
+                tr("Not Connected")
+            };
+            let status_label =
+                NSTextField::labelWithString(&NSString::from_str(&device_status), self.mtm());
             status_label.setFrame(NSRect::new(
                 NSPoint::new(text_x, 9.0),
                 NSSize::new(title_width, 16.0),
@@ -2019,6 +2365,148 @@ impl Delegate {
             row.addSubview(&select_button);
             device_list.addSubview(&row);
             self.ivars().device_row_views.borrow_mut().push(row);
+
+            y -= row_height + row_gap;
+
+            let storages = if current_location == Some(device.location_id) {
+                self.ivars()
+                    .device_storages
+                    .borrow()
+                    .get(&device.location_id)
+                    .cloned()
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            for (storage_index, storage) in storages.iter().enumerate() {
+                let key = StorageKey {
+                    location_id: device.location_id,
+                    storage_id: storage.id,
+                };
+                let storage_row = DeviceRowView::new(self.mtm());
+                let row: Retained<NSView> = storage_row.clone().into_super();
+                row.setFrame(NSRect::new(
+                    NSPoint::new(0.0, y.max(0.0)),
+                    NSSize::new(list_width, storage_row_height),
+                ));
+                row.setAutoresizingMask(
+                    NSAutoresizingMaskOptions::ViewMinYMargin
+                        | NSAutoresizingMaskOptions::ViewWidthSizable,
+                );
+
+                let hover_background = NSBox::initWithFrame(
+                    NSBox::alloc(self.mtm()),
+                    NSRect::new(
+                        NSPoint::new(24.0, 1.0),
+                        NSSize::new((list_width - 24.0).max(0.0), storage_row_height - 2.0),
+                    ),
+                );
+                hover_background.setBoxType(NSBoxType::Custom);
+                hover_background.setCornerRadius(6.0);
+                hover_background.setTransparent(false);
+                hover_background.setFillColor(&NSColor::separatorColor());
+                hover_background.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
+                row.addSubview(&hover_background);
+                storage_row.set_hover_background(hover_background);
+
+                if selected_storage == Some(key) {
+                    let background = NSBox::initWithFrame(
+                        NSBox::alloc(self.mtm()),
+                        NSRect::new(
+                            NSPoint::new(24.0, 1.0),
+                            NSSize::new((list_width - 24.0).max(0.0), storage_row_height - 2.0),
+                        ),
+                    );
+                    background.setBoxType(NSBoxType::Custom);
+                    background.setCornerRadius(6.0);
+                    background.setTransparent(false);
+                    background.setFillColor(&NSColor::unemphasizedSelectedContentBackgroundColor());
+                    background.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
+                    row.addSubview(&background);
+                }
+
+                if let Some(icon) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                    ns_string!("internaldrive"),
+                    Some(&ns_tr("Storage")),
+                ) {
+                    let image_view = NSImageView::imageViewWithImage(&icon, self.mtm());
+                    image_view.setFrame(NSRect::new(
+                        NSPoint::new(34.0, 12.0),
+                        NSSize::new(17.0, 17.0),
+                    ));
+                    image_view.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMaxXMargin);
+                    row.addSubview(&image_view);
+                }
+
+                let storage_text_x = 58.0;
+                let storage_title_width = (list_width - storage_text_x - 10.0).max(0.0);
+                let title = self.storage_name(key).unwrap_or_else(|| tr("Storage"));
+                let title_label =
+                    NSTextField::labelWithString(&NSString::from_str(&title), self.mtm());
+                title_label.setFrame(NSRect::new(
+                    NSPoint::new(storage_text_x, 37.0),
+                    NSSize::new(storage_title_width, 16.0),
+                ));
+                title_label.setFont(Some(&NSFont::systemFontOfSize(12.0)));
+                title_label.setUsesSingleLineMode(true);
+                title_label.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+                title_label.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
+                title_label.setTextColor(Some(&NSColor::labelColor()));
+
+                let storage_progress = NSProgressIndicator::new(self.mtm());
+                storage_progress.setFrame(NSRect::new(
+                    NSPoint::new(storage_text_x, 24.0),
+                    NSSize::new(storage_title_width, 8.0),
+                ));
+                storage_progress.setIndeterminate(false);
+                storage_progress.setMinValue(0.0);
+                storage_progress.setMaxValue(100.0);
+                storage_progress.setDoubleValue(Self::storage_used_percent(storage));
+                storage_progress.setControlSize(objc2_app_kit::NSControlSize::Small);
+                storage_progress.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
+
+                let status_label = NSTextField::labelWithString(
+                    &NSString::from_str(&self.mount_status(key)),
+                    self.mtm(),
+                );
+                status_label.setFrame(NSRect::new(
+                    NSPoint::new(storage_text_x, 6.0),
+                    NSSize::new(storage_title_width, 14.0),
+                ));
+                status_label.setFont(Some(&NSFont::systemFontOfSize(11.0)));
+                status_label.setUsesSingleLineMode(true);
+                status_label.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+                status_label.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
+                status_label.setTextColor(Some(&NSColor::secondaryLabelColor()));
+
+                let select_button = unsafe {
+                    NSButton::buttonWithTitle_target_action(
+                        ns_string!(""),
+                        Some(self),
+                        Some(sel!(selectStorage:)),
+                        self.mtm(),
+                    )
+                };
+                select_button.setFrame(NSRect::new(
+                    NSPoint::new(24.0, 1.0),
+                    NSSize::new((list_width - 24.0).max(0.0), storage_row_height - 2.0),
+                ));
+                select_button.setBordered(false);
+                select_button.setTransparent(true);
+                select_button.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
+                select_button.setTag(Self::storage_button_tag(index, storage_index));
+                select_button.setEnabled(controls_enabled);
+                storage_row.install_hover_tracking();
+
+                row.addSubview(&title_label);
+                row.addSubview(&storage_progress);
+                row.addSubview(&status_label);
+                row.addSubview(&select_button);
+                device_list.addSubview(&row);
+                self.ivars().device_row_views.borrow_mut().push(row);
+
+                y -= storage_row_height + row_gap;
+            }
         }
     }
 }
@@ -2073,7 +2561,7 @@ fn run_copy_worker(
 fn run_device_connect_worker(
     device_info: MtpDeviceInfo,
     mtp_lock: Arc<Mutex<()>>,
-) -> Result<(MtpDevice, Vec<BrowserNode>, Vec<usize>), String> {
+) -> Result<(MtpDevice, Vec<BrowserNode>, Vec<usize>, Vec<StorageSummary>), String> {
     let _guard = mtp_lock
         .lock()
         .map_err(|_| tr("MTP operation lock is poisoned."))?;
@@ -2092,8 +2580,45 @@ fn run_device_connect_worker(
     let storages = runtime
         .block_on(async { device.storages().await })
         .map_err(|err| format_mtp_error(&err))?;
+    let summaries = storages
+        .iter()
+        .map(|storage| StorageSummary {
+            id: storage.id(),
+            info: storage.info().clone(),
+        })
+        .collect::<Vec<_>>();
     let (nodes, roots) = storage_nodes(storages);
-    Ok((device, nodes, roots))
+    Ok((device, nodes, roots, summaries))
+}
+
+fn run_storage_refresh_worker(
+    device: MtpDevice,
+    mtp_lock: Arc<Mutex<()>>,
+) -> Result<(Vec<BrowserNode>, Vec<usize>, Vec<StorageSummary>), String> {
+    let _guard = mtp_lock
+        .lock()
+        .map_err(|_| tr("MTP operation lock is poisoned."))?;
+    let runtime = Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| {
+            format!(
+                "{}: {err}",
+                tr("Unable to create device connection runtime")
+            )
+        })?;
+    let storages = runtime
+        .block_on(async { device.storages().await })
+        .map_err(|err| format_mtp_error(&err))?;
+    let summaries = storages
+        .iter()
+        .map(|storage| StorageSummary {
+            id: storage.id(),
+            info: storage.info().clone(),
+        })
+        .collect::<Vec<_>>();
+    let (nodes, roots) = storage_nodes(storages);
+    Ok((nodes, roots, summaries))
 }
 
 fn storage_nodes(storages: Vec<mtp_rs::Storage>) -> (Vec<BrowserNode>, Vec<usize>) {
@@ -2129,7 +2654,7 @@ fn storage_nodes(storages: Vec<mtp_rs::Storage>) -> (Vec<BrowserNode>, Vec<usize
     if roots.is_empty() {
         nodes.push(message_node(
             &tr("Device Has No Available Storage"),
-            &tr("The MTP device did not return a storage list."),
+            &tr("The MTP device did not return a storage list. Unlock the device, allow file access on the phone, choose File Transfer / MTP, then refresh."),
         ));
         roots.push(0);
     }
