@@ -1187,8 +1187,17 @@ impl Delegate {
         if selected.is_some() && root.is_none() {
             self.ivars().selected_storage.borrow_mut().take();
         }
-        *self.ivars().root_children.borrow_mut() =
-            root.map(|index| vec![index]).unwrap_or_default();
+        if let Some(index) = root {
+            self.load_children(index);
+            let children = self.ivars().nodes.borrow()[index].children.clone();
+            if children.is_empty() {
+                *self.ivars().root_children.borrow_mut() = vec![index];
+            } else {
+                *self.ivars().root_children.borrow_mut() = children;
+            }
+        } else {
+            *self.ivars().root_children.borrow_mut() = Vec::new();
+        }
         self.reload_outline();
     }
 
